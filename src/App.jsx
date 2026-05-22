@@ -1,26 +1,47 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+// ============================================================================
+//  真心话大冒险 · 联机版
+// ============================================================================
+import React, { useState, useEffect, useRef } from 'react';
+import { ref, set, update, get, onValue } from 'firebase/database';
+import { db } from './firebase';
 import { quickQuestions, decks, skipPenalties } from './data/questions';
 
-// ── Utilities ─────────────────────────────────────────────────────────────────
-const shuffle = (arr) => [...arr].sort(() => Math.random() - 0.5);
+// ── Utilities ────────────────────────────────────────────────────────────────
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-const INTENSITY_DECK_IDS = {
+// Stable player ID per browser session
+const myUid = (() => {
+  let id = sessionStorage.getItem('tod_uid');
+  if (!id) {
+    id = Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+    sessionStorage.setItem('tod_uid', id);
+  }
+  return id;
+})();
+
+const genCode = () => {
+  const s = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from({ length: 4 }, () => s[Math.floor(Math.random() * s.length)]).join('');
+};
+
+const DECK_IDS = {
   mild:   ['ice', 'secret', 'friends', 'dare-light'],
   spicy:  ['ambiguous', 'explosive', 'dare-hot'],
   random: ['secret', 'ambiguous', 'explosive', 'friends', 'ice', 'dare-light', 'dare-hot'],
 };
 
-// ── Star Background ────────────────────────────────────────────────────────────
+const VOTE_MS = 7000; // 7-second voting window
+
+// ── Stars Background ─────────────────────────────────────────────────────────
 function Stars() {
   const stars = useRef(
-    Array.from({ length: 60 }, (_, i) => ({
+    Array.from({ length: 50 }, (_, i) => ({
       id: i,
       x: Math.random() * 100,
       y: Math.random() * 100,
-      size: Math.random() * 2 + 1,
-      duration: (Math.random() * 3 + 2).toFixed(1),
-      delay: (Math.random() * 4).toFixed(1),
+      size: Math.random() * 2 + 0.5,
+      dur: (Math.random() * 3 + 2).toFixed(1),
+      del: (Math.random() * 4).toFixed(1),
     }))
   ).current;
 
@@ -31,12 +52,9 @@ function Stars() {
           key={s.id}
           className="star"
           style={{
-            left: `${s.x}%`,
-            top: `${s.y}%`,
-            width: s.size,
-            height: s.size,
-            '--duration': `${s.duration}s`,
-            '--delay': `${s.delay}s`,
+            left: `${s.x}%`, top: `${s.y}%`,
+            width: s.size, height: s.size,
+            '--duration': `${s.dur}s`, '--delay': `${s.del}s`,
           }}
         />
       ))}
@@ -44,504 +62,693 @@ function Stars() {
   );
 }
 
-// ── Main App ───────────────────────────────────────────────────────────────────
+// ── Firebase Setup Guard ──────────────────────────────────────────────────────
+function FirebaseNotConfigured() {
+  return (
+    <div className="min-h-screen bg-party relative flex flex-col items-center justify-center px-6 text-center">
+      <Stars />
+      <div className="relative z-10 max-w-sm space-y-4">
+        <div className="text-5xl">🔧</div>
+        <h2 className="text-white font-black text-2xl">需要配置 Firebase</h2>
+        <div className="bg-white/5 border border-white/15 rounded-2xl p-5 text-left space-y-2 text-sm">
+          <p className="text-white/70 font-bold mb-3">快速设置步骤：</p>
+          <p className="text-white/60">1. 访问 <span className="text-purple-400">console.firebase.google.com</span></p>
+          <p className="text-white/60">2. 新建项目 → 构建 → Realtime Database → 创建（测试模式）</p>
+          <p className="text-white/60">3. 项目设置 → 您的应用 → 注册 Web 应用</p>
+          <p className="text-white/60">4. 复制 firebaseConfig 到 <span className="text-purple-400">src/firebase.js</span></p>
+        </div>
+        <p className="text-white/30 text-xs">配置完成后刷新页面即可使用</p>
+      </div>
+    </div>
+  );
+}
+
+// ── App (main) ────────────────────────────────────────────────────────────────
 export default function App() {
-  // phase: 'setup' | 'voting' | 'result' | 'deck-select' | 'card-reveal'
-  const [phase, setPhase] = useState('setup');
+  // Check Firebase config
+  try {
+    const testRef = ref(db, '.info/connected');
+    void testRef;
+  } catch {
+    return <FirebaseNotConfigured />;
+  }
 
-  // setup
-  const [playerInputs, setPlayerInputs] = useState(['', '']);
-
-  // game
-  const [players, setPlayers] = useState([]);
-  const [round, setRound] = useState(1);
-  const [currentQ, setCurrentQ] = useState(null);
-  const [votes, setVotes] = useState({});       // { name: 'A'|'B'|null }
-  const [timeLeft, setTimeLeft] = useState(5);
-  const [timerActive, setTimerActive] = useState(false);
-  const [loser, setLoser] = useState(null);
-  const [voteBreakdown, setVoteBreakdown] = useState(null); // {a:[],b:[],minority,dangerZone}
-  const [selectedDeck, setSelectedDeck] = useState(null);
-  const [currentCard, setCurrentCard] = useState(null);
-  const [cardFlipped, setCardFlipped] = useState(false);
-  const [skipChances, setSkipChances] = useState({});
-  const [skipPenalty, setSkipPenalty] = useState(null);
-
-  // settings
-  const [gameMode, setGameMode] = useState('both'); // 'both' | 'truth'
-  const [intensity, setIntensity] = useState('random');
-
-  // modals
+  const [screen, setScreen] = useState('home'); // 'home' | 'game'
+  const [roomCode, setRoomCode] = useState('');
+  const [room, setRoom] = useState(null);
+  const [myName, setMyName] = useState(() => sessionStorage.getItem('tod_name') || '');
+  const [joinCode, setJoinCode] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(0);
   const [showHistory, setShowHistory] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const [fbError, setFbError] = useState(false);
 
-  // history
-  const [history, setHistory] = useState([]);
-
-  // track used questions across rounds
-  const usedQIds = useRef(new Set());
-  const usedCardIds = useRef({});
-
+  const revealFired = useRef(false);
+  const nextFired = useRef(false);
   const timerRef = useRef(null);
 
-  // ── Timer ───────────────────────────────────────────────────────────────────
+  const players = room?.players || {};
+  const isHost = room?.hostId === myUid;
+  const isLoser = room?.loser === myUid;
+  const myVote = room?.votes?.[myUid] ?? null;
+  const playerCount = Object.keys(players).length;
+  const votedCount = Object.values(room?.votes || {}).filter(Boolean).length;
+  const allVoted = playerCount > 0 && votedCount >= playerCount;
+  const myReady = players[myUid]?.ready ?? false;
+
+  // ── Firebase subscription ─────────────────────────────────────────────────
   useEffect(() => {
-    if (!timerActive) return;
-    if (timeLeft <= 0) {
-      setTimerActive(false);
-      doFinalizeVotes();
-      return;
-    }
-    timerRef.current = setTimeout(() => setTimeLeft((t) => t - 1), 1000);
-    return () => clearTimeout(timerRef.current);
-  }, [timerActive, timeLeft]);
+    if (!roomCode) return;
+    const rRef = ref(db, `rooms/${roomCode}`);
+    const unsub = onValue(
+      rRef,
+      (snap) => {
+        if (!snap.exists()) { setScreen('home'); setRoomCode(''); return; }
+        setRoom(snap.val());
+      },
+      () => setFbError(true)
+    );
+    return () => unsub();
+  }, [roomCode]);
 
-  // ── Game helpers ────────────────────────────────────────────────────────────
-  const getAvailableDecks = useCallback(() => {
-    const ids = INTENSITY_DECK_IDS[intensity] ?? INTENSITY_DECK_IDS.random;
-    return decks.filter((d) => {
-      if (!ids.includes(d.id)) return false;
-      if (gameMode === 'truth' && d.type === 'dare') return false;
-      return true;
-    });
-  }, [intensity, gameMode]);
+  // ── Timer (local computation from server deadline) ────────────────────────
+  useEffect(() => {
+    clearInterval(timerRef.current);
+    if (!room?.voteDeadline || room?.phase !== 'voting') { setTimeLeft(0); return; }
+    const tick = () =>
+      setTimeLeft(Math.max(0, Math.ceil((room.voteDeadline - Date.now()) / 1000)));
+    tick();
+    timerRef.current = setInterval(tick, 250);
+    return () => clearInterval(timerRef.current);
+  }, [room?.voteDeadline, room?.phase]);
 
-  const pickCard = (deck) => {
-    const used = usedCardIds.current[deck.id] ?? new Set();
-    const pool = deck.questions.filter((q) => !used.has(q.id));
-    const chosen = pool.length > 0 ? pick(pool) : pick(deck.questions);
-    if (pool.length > 0) {
-      if (!usedCardIds.current[deck.id]) usedCardIds.current[deck.id] = new Set();
-      usedCardIds.current[deck.id].add(chosen.id);
+  // ── Host: auto-reveal when timer ends or all voted ────────────────────────
+  useEffect(() => {
+    if (!isHost || room?.phase !== 'voting' || room?.votesRevealed || revealFired.current) return;
+    if (timeLeft <= 0 || allVoted) {
+      revealFired.current = true;
+      doReveal();
     }
-    return chosen;
+  }, [timeLeft, allVoted, isHost, room?.phase, room?.votesRevealed]);
+
+  // Reset guards when a new voting phase begins
+  useEffect(() => {
+    if (room?.phase === 'voting') {
+      revealFired.current = false;
+      nextFired.current = false;
+    }
+  }, [room?.phase]);
+
+  // ── Host: advance to next round when all players are ready ────────────────
+  useEffect(() => {
+    if (!isHost || room?.phase !== 'card-reveal' || nextFired.current) return;
+    const vals = Object.values(players);
+    if (vals.length >= 2 && vals.every((p) => p.ready)) {
+      nextFired.current = true;
+      doNextRound();
+    }
+  }, [players, room?.phase, isHost]);
+
+  // Save name
+  useEffect(() => {
+    if (myName) sessionStorage.setItem('tod_name', myName);
+  }, [myName]);
+
+  // ── Actions ───────────────────────────────────────────────────────────────
+
+  const doCreate = async () => {
+    const name = myName.trim();
+    if (!name) { setError('请先输入你的名字'); return; }
+    setBusy(true); setError('');
+    try {
+      let code;
+      for (let i = 0; i < 10; i++) {
+        code = genCode();
+        const s = await get(ref(db, `rooms/${code}/hostId`));
+        if (!s.exists()) break;
+      }
+      await set(ref(db, `rooms/${code}`), {
+        hostId: myUid,
+        phase: 'lobby',
+        round: 0,
+        settings: { gameMode: 'both', intensity: 'random' },
+        players: { [myUid]: { name, skipChances: 1, ready: false } },
+        createdAt: Date.now(),
+        votes: {},
+        votesRevealed: false,
+        usedQuestionIds: {},
+        usedCardIds: {},
+      });
+      setRoomCode(code);
+      setScreen('game');
+    } catch (e) {
+      setError('创建失败，请检查 Firebase 配置和网络');
+    }
+    setBusy(false);
   };
 
-  const beginNewRound = (playerList) => {
-    // pick quick question
-    let pool = quickQuestions.filter((q) => !usedQIds.current.has(q.id));
-    if (pool.length === 0) {
-      usedQIds.current = new Set();
-      pool = [...quickQuestions];
+  const doJoin = async () => {
+    const name = myName.trim();
+    if (!name) { setError('请先输入你的名字'); return; }
+    const code = joinCode.trim().toUpperCase();
+    if (code.length !== 4) { setError('房间号是4位字母/数字'); return; }
+    setBusy(true); setError('');
+    try {
+      const snap = await get(ref(db, `rooms/${code}`));
+      if (!snap.exists()) { setError('找不到这个房间，检查一下房间号'); setBusy(false); return; }
+      const d = snap.val();
+      if (d.phase !== 'lobby') { setError('游戏已经开始了，加入不了'); setBusy(false); return; }
+      if (Object.keys(d.players || {}).length >= 10) { setError('房间满了'); setBusy(false); return; }
+      await update(ref(db, `rooms/${code}/players/${myUid}`), {
+        name, skipChances: 1, ready: false,
+      });
+      setRoomCode(code);
+      setScreen('game');
+    } catch {
+      setError('加入失败，请重试');
     }
+    setBusy(false);
+  };
+
+  const doStart = () => doNextRound(true);
+
+  const doNextRound = async (first = false) => {
+    const usedIds = Object.keys(room?.usedQuestionIds || {}).map(Number);
+    let pool = quickQuestions.filter((q) => !usedIds.includes(q.id));
+    if (!pool.length) pool = [...quickQuestions];
     const q = pick(pool);
-    usedQIds.current.add(q.id);
-    setCurrentQ(q);
 
-    const initVotes = {};
-    playerList.forEach((p) => { initVotes[p] = null; });
-    setVotes(initVotes);
-    setTimeLeft(5);
-    setTimerActive(false);
-    setLoser(null);
-    setVoteBreakdown(null);
-    setSelectedDeck(null);
-    setCurrentCard(null);
-    setCardFlipped(false);
-    setSkipPenalty(null);
-    setPhase('voting');
-  };
+    const resets = {};
+    Object.keys(players).forEach((uid) => { resets[`players/${uid}/ready`] = false; });
 
-  const startGame = () => {
-    const valid = playerInputs.map((p) => p.trim()).filter(Boolean);
-    if (valid.length < 2) return;
-    const list = shuffle(valid);
-    setPlayers(list);
-    const sc = {};
-    list.forEach((p) => { sc[p] = 1; });
-    setSkipChances(sc);
-    setRound(1);
-    setHistory([]);
-    usedQIds.current = new Set();
-    usedCardIds.current = {};
-    beginNewRound(list);
-  };
-
-  const castVote = (player, choice) => {
-    setVotes((prev) => ({ ...prev, [player]: choice }));
-  };
-
-  const lockVotes = () => {
-    clearTimeout(timerRef.current);
-    setTimerActive(false);
-    setTimeLeft(0);
-    doFinalizeVotes();
-  };
-
-  const doFinalizeVotes = () => {
-    // fill unvoted
-    const final = { ...votes };
-    players.forEach((p) => {
-      if (!final[p]) final[p] = pick(['A', 'B']);
+    await update(ref(db, `rooms/${roomCode}`), {
+      phase: 'voting',
+      round: first ? 1 : (room?.round || 0) + 1,
+      currentQuestion: q,
+      votes: {},
+      votesRevealed: false,
+      loser: null,
+      loserName: null,
+      voteBreakdown: null,
+      deckId: null, deckName: null, deckIcon: null, deckGradient: null, deckGlow: null,
+      card: null, cardFlipped: false, skipPenalty: null,
+      voteDeadline: Date.now() + VOTE_MS,
+      [`usedQuestionIds/${q.id}`]: true,
+      ...resets,
     });
-    setVotes(final);
-
-    const aVoters = players.filter((p) => final[p] === 'A');
-    const bVoters = players.filter((p) => final[p] === 'B');
-
-    let dangerZone, minority;
-    if (aVoters.length === bVoters.length) {
-      dangerZone = [...players];
-      minority = 'tie';
-    } else if (aVoters.length < bVoters.length) {
-      dangerZone = aVoters;
-      minority = 'A';
-    } else {
-      dangerZone = bVoters;
-      minority = 'B';
-    }
-
-    const loserPlayer = pick(dangerZone);
-    setVoteBreakdown({ a: aVoters, b: bVoters, minority, dangerZone });
-    setLoser(loserPlayer);
-    setPhase('result');
   };
 
-  const handleSkip = () => {
-    const chances = skipChances[loser] ?? 0;
+  const doVote = async (choice) => {
+    if (myVote || room?.phase !== 'voting') return;
+    await update(ref(db, `rooms/${roomCode}/votes`), { [myUid]: choice });
+  };
+
+  const doReveal = async () => {
+    if (!isHost) return;
+    const snap = await get(ref(db, `rooms/${roomCode}`));
+    const d = snap.val();
+    if (!d || d.phase !== 'voting' || d.votesRevealed) return;
+
+    const votes = d.votes || {};
+    const allUids = Object.keys(d.players || {});
+
+    const final = { ...votes };
+    allUids.forEach((uid) => { if (!final[uid]) final[uid] = pick(['A', 'B']); });
+
+    const aUids = allUids.filter((u) => final[u] === 'A');
+    const bUids = allUids.filter((u) => final[u] === 'B');
+    let danger, minority;
+    if (aUids.length === bUids.length) { danger = allUids; minority = 'tie'; }
+    else if (aUids.length < bUids.length) { danger = aUids; minority = 'A'; }
+    else { danger = bUids; minority = 'B'; }
+
+    const loserUid = pick(danger);
+    const loserName = d.players[loserUid]?.name || '???';
+    const aNames = aUids.map((u) => d.players[u]?.name || u);
+    const bNames = bUids.map((u) => d.players[u]?.name || u);
+
+    await update(ref(db, `rooms/${roomCode}`), {
+      votes: final,
+      votesRevealed: true,
+      loser: loserUid,
+      loserName,
+      voteBreakdown: { a: aNames, b: bNames, minority },
+      phase: 'revealing',
+      [`history/${d.round}`]: {
+        round: d.round,
+        question: d.currentQuestion?.question,
+        loserName,
+        voteA: aNames,
+        voteB: bNames,
+      },
+    });
+  };
+
+  const doForceReveal = () => {
+    if (!isHost || room?.phase !== 'voting' || revealFired.current) return;
+    revealFired.current = true;
+    doReveal();
+  };
+
+  const doGoToDeckSelect = async () => {
+    await update(ref(db, `rooms/${roomCode}`), { phase: 'deck-select' });
+  };
+
+  const doSelectDeck = async (deck) => {
+    const usedCards = Object.keys(room?.usedCardIds?.[deck.id] || {}).map(Number);
+    let pool = deck.questions.filter((q) => !usedCards.includes(q.id));
+    if (!pool.length) pool = [...deck.questions];
+    const card = pick(pool);
+    await update(ref(db, `rooms/${roomCode}`), {
+      phase: 'card-reveal',
+      deckId: deck.id, deckName: deck.name, deckIcon: deck.icon,
+      deckGradient: deck.gradient, deckGlow: deck.glow,
+      card: card.text, cardFlipped: false,
+      [`usedCardIds/${deck.id}/${card.id}`]: true,
+    });
+  };
+
+  const doSelectRandom = async () => {
+    const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
+    const ids = DECK_IDS[intensity] || DECK_IDS.random;
+    const avail = decks.filter(
+      (d) => ids.includes(d.id) && (gameMode !== 'truth' || d.type !== 'dare')
+    );
+    if (avail.length) await doSelectDeck(pick(avail));
+  };
+
+  const doSkip = async () => {
+    const chances = players[myUid]?.skipChances ?? 0;
     if (chances <= 0) return;
-    setSkipChances((prev) => ({ ...prev, [loser]: chances - 1 }));
-    setSkipPenalty(pick(skipPenalties));
+    const penalty = pick(skipPenalties);
+    await update(ref(db, `rooms/${roomCode}`), {
+      [`players/${myUid}/skipChances`]: chances - 1,
+      phase: 'card-reveal',
+      card: penalty, cardFlipped: true,
+      deckName: '跳过惩罚', deckIcon: '🏃',
+      deckGradient: 'from-yellow-600 to-amber-800',
+      deckGlow: 'rgba(245,158,11,0.5)',
+    });
   };
 
-  const selectDeck = (deck) => {
-    const card = pickCard(deck);
-    setSelectedDeck(deck);
-    setCurrentCard(card);
-    setCardFlipped(false);
-    setPhase('card-reveal');
-    setTimeout(() => setCardFlipped(true), 400);
+  const doFlip = async () => {
+    if (room?.cardFlipped) return;
+    await update(ref(db, `rooms/${roomCode}`), { cardFlipped: true });
   };
 
-  const selectRandom = () => {
-    const available = getAvailableDecks();
-    if (!available.length) return;
-    selectDeck(pick(available));
+  const doReady = async () => {
+    if (myReady) return;
+    await update(ref(db, `rooms/${roomCode}/players/${myUid}`), { ready: true });
   };
 
-  const completeRound = () => {
-    const entry = {
-      round,
-      question: currentQ?.question,
-      optionA: currentQ?.optionA,
-      optionB: currentQ?.optionB,
-      loser,
-      voteA: voteBreakdown?.a ?? [],
-      voteB: voteBreakdown?.b ?? [],
-      deckName: selectedDeck?.name ?? '(已跳过)',
-      card: currentCard?.text ?? skipPenalty ?? '—',
-      skipped: !currentCard && !!skipPenalty,
-    };
-    setHistory((h) => [...h, entry]);
-    setRound((r) => r + 1);
-    beginNewRound(players);
+  const doUpdateSettings = async (settings) => {
+    await update(ref(db, `rooms/${roomCode}/settings`), settings);
   };
 
-  const restartGame = () => {
-    setPhase('setup');
-    setPlayers([]);
-    setPlayerInputs(['', '']);
-    setRound(1);
-    setHistory([]);
+  const doCopyCode = () => {
+    navigator.clipboard?.writeText(roomCode);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
   };
 
-  // ── Renders by phase ────────────────────────────────────────────────────────
+  const doLeave = () => {
+    if (room?.phase === 'lobby') {
+      update(ref(db, `rooms/${roomCode}/players`), { [myUid]: null });
+    }
+    setScreen('home'); setRoomCode(''); setRoom(null); setError('');
+  };
 
-  if (phase === 'setup') {
+  // ── Render ────────────────────────────────────────────────────────────────
+
+  if (fbError) {
     return (
-      <SetupScreen
-        playerInputs={playerInputs}
-        setPlayerInputs={setPlayerInputs}
-        gameMode={gameMode}
-        setGameMode={setGameMode}
-        intensity={intensity}
-        setIntensity={setIntensity}
-        onStart={startGame}
+      <div className="min-h-screen bg-party flex items-center justify-center px-6 text-center">
+        <Stars />
+        <div className="relative z-10">
+          <p className="text-red-400 text-lg font-bold mb-2">Firebase 连接失败</p>
+          <p className="text-white/40 text-sm">请检查 src/firebase.js 配置</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (screen === 'home') {
+    return (
+      <HomeScreen
+        myName={myName} setMyName={setMyName}
+        joinCode={joinCode} setJoinCode={setJoinCode}
+        error={error} busy={busy}
+        onCreate={doCreate} onJoin={doJoin}
       />
     );
   }
 
-  // Shared header
-  const header = (
-    <div className="flex items-center justify-between px-4 pt-5 pb-2 relative z-10">
-      <div className="flex items-center gap-2">
-        <span className="text-2xl">🎲</span>
-        <span className="font-bold text-white/70 text-sm tracking-widest uppercase">
-          第 {round} 轮
-        </span>
+  if (!room) {
+    return (
+      <div className="min-h-screen bg-party flex items-center justify-center">
+        <Stars />
+        <p className="text-white/40 z-10">连接中...</p>
       </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => setShowHistory(true)}
-          className="px-3 py-1.5 rounded-xl bg-white/10 text-white/70 text-xs font-medium hover:bg-white/20 transition-all"
-        >
-          📋 历史
-        </button>
-        <button
-          onClick={() => setShowSettings(true)}
-          className="px-3 py-1.5 rounded-xl bg-white/10 text-white/70 text-xs font-medium hover:bg-white/20 transition-all"
-        >
-          ⚙️ 设置
-        </button>
-        <button
-          onClick={restartGame}
-          className="px-3 py-1.5 rounded-xl bg-white/10 text-white/70 text-xs font-medium hover:bg-white/20 transition-all"
-        >
-          🔄 重开
-        </button>
-      </div>
-    </div>
-  );
+    );
+  }
+
+  const phase = room.phase;
 
   return (
     <div className="min-h-screen bg-party relative flex flex-col">
       <Stars />
-      {header}
+
+      {/* Header */}
+      <header className="flex items-center justify-between px-4 pt-4 pb-2 relative z-10">
+        <button
+          onClick={doLeave}
+          className="text-white/40 hover:text-white/70 text-sm transition-all"
+        >
+          ← 退出
+        </button>
+        <div className="flex items-center gap-2">
+          {phase !== 'lobby' && (
+            <span className="text-white/30 text-xs">第 {room.round} 轮</span>
+          )}
+          <button
+            onClick={doCopyCode}
+            className="font-mono font-bold text-sm px-3 py-1.5 rounded-xl bg-white/10 text-white/70 hover:bg-white/20 transition-all"
+          >
+            {copied ? '✅ 已复制' : `🏠 ${roomCode}`}
+          </button>
+          {phase !== 'lobby' && (
+            <button
+              onClick={() => setShowHistory(true)}
+              className="px-2.5 py-1.5 rounded-xl bg-white/10 text-white/50 text-xs hover:bg-white/20"
+            >
+              📋
+            </button>
+          )}
+        </div>
+      </header>
 
       <div className="flex-1 flex flex-col relative z-10">
-        {phase === 'voting' && (
-          <VotingScreen
-            question={currentQ}
-            players={players}
-            votes={votes}
-            timeLeft={timeLeft}
-            timerActive={timerActive}
-            onStartTimer={() => setTimerActive(true)}
-            onVote={castVote}
-            onLock={lockVotes}
+        {phase === 'lobby' && (
+          <LobbyPhase
+            room={room} myUid={myUid} isHost={isHost}
+            onStart={doStart} onSettings={doUpdateSettings}
+            onCopyCode={doCopyCode} copied={copied}
           />
         )}
-        {phase === 'result' && (
-          <ResultScreen
-            loser={loser}
-            voteBreakdown={voteBreakdown}
-            currentQ={currentQ}
-            skipChances={skipChances}
-            skipPenalty={skipPenalty}
-            onSkip={handleSkip}
-            onDrawCard={() => setPhase('deck-select')}
-            onAcceptPenalty={completeRound}
-            gameMode={gameMode}
+        {phase === 'voting' && (
+          <VotingPhase
+            room={room} myUid={myUid} myVote={myVote}
+            timeLeft={timeLeft} isHost={isHost}
+            onVote={doVote} onForceReveal={doForceReveal}
+          />
+        )}
+        {phase === 'revealing' && (
+          <RevealingPhase
+            room={room} myUid={myUid} isLoser={isLoser}
+            players={players} skipChances={players[myUid]?.skipChances ?? 0}
+            onDrawCard={doGoToDeckSelect} onSkip={doSkip}
           />
         )}
         {phase === 'deck-select' && (
-          <DeckSelectScreen
-            loser={loser}
-            availableDecks={getAvailableDecks()}
-            onSelect={selectDeck}
-            onRandom={selectRandom}
+          <DeckSelectPhase
+            room={room} myUid={myUid} isLoser={isLoser}
+            onSelectDeck={doSelectDeck} onSelectRandom={doSelectRandom}
           />
         )}
         {phase === 'card-reveal' && (
-          <CardRevealScreen
-            loser={loser}
-            deck={selectedDeck}
-            card={currentCard}
-            flipped={cardFlipped}
-            onFlip={() => setCardFlipped(true)}
-            onDone={completeRound}
+          <CardRevealPhase
+            room={room} myUid={myUid} players={players}
+            myReady={myReady} onFlip={doFlip} onReady={doReady}
           />
         )}
       </div>
 
-      {/* Modals */}
       {showHistory && (
-        <HistoryModal history={history} onClose={() => setShowHistory(false)} />
-      )}
-      {showSettings && (
-        <SettingsModal
-          gameMode={gameMode}
-          setGameMode={setGameMode}
-          intensity={intensity}
-          setIntensity={setIntensity}
-          onClose={() => setShowSettings(false)}
-        />
+        <HistoryModal history={room.history || {}} onClose={() => setShowHistory(false)} />
       )}
 
-      <footer className="text-center text-white/20 text-xs py-4 relative z-10">
+      <footer className="text-center text-white/20 text-xs py-3 relative z-10">
         游戏归游戏，别真的伤害朋友感情。💙
       </footer>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SETUP SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function SetupScreen({ playerInputs, setPlayerInputs, gameMode, setGameMode, intensity, setIntensity, onStart }) {
-  const valid = playerInputs.map((p) => p.trim()).filter(Boolean);
-  const canStart = valid.length >= 2;
-
-  const addPlayer = () => {
-    if (playerInputs.length < 10) setPlayerInputs((p) => [...p, '']);
-  };
-
-  const removePlayer = (i) => {
-    if (playerInputs.length > 2) setPlayerInputs((p) => p.filter((_, idx) => idx !== i));
-  };
-
-  const updatePlayer = (i, val) => {
-    setPlayerInputs((p) => { const n = [...p]; n[i] = val; return n; });
-  };
-
-  const shufflePlayers = () => {
-    setPlayerInputs((p) => shuffle([...p]));
-  };
+// ═════════════════════════════════════════════════════════════════════════════
+//  HOME SCREEN
+// ═════════════════════════════════════════════════════════════════════════════
+function HomeScreen({ myName, setMyName, joinCode, setJoinCode, error, busy, onCreate, onJoin }) {
+  const [tab, setTab] = useState('create'); // 'create' | 'join'
 
   return (
-    <div className="min-h-screen bg-party relative flex flex-col items-center px-4 py-8">
+    <div className="min-h-screen bg-party relative flex flex-col items-center justify-center px-4 py-8">
       <Stars />
 
-      {/* Title */}
-      <div className="relative z-10 text-center mb-8 animate-float">
-        <div className="text-6xl mb-3">🎲</div>
-        <h1 className="text-4xl font-black tracking-tight bg-gradient-to-r from-purple-400 via-pink-400 to-orange-400 bg-clip-text text-transparent">
+      <div className="relative z-10 text-center mb-8">
+        <div className="text-6xl mb-3 animate-float inline-block">🎲</div>
+        <h1 className="text-4xl font-black bg-gradient-to-r from-purple-400 via-pink-400 to-orange-400 bg-clip-text text-transparent">
           真心话 · 大冒险
         </h1>
-        <p className="text-white/40 mt-2 text-sm">派对小游戏 · 2–10 人</p>
+        <p className="text-white/40 mt-1 text-sm">联机派对小游戏</p>
       </div>
 
-      <div className="relative z-10 w-full max-w-md space-y-4">
-        {/* Player inputs */}
-        <div className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-5 space-y-3">
-          <div className="flex items-center justify-between mb-1">
-            <h2 className="text-white font-bold text-sm tracking-wide">
-              👥 玩家名单（{valid.length}/10）
-            </h2>
-            <button
-              onClick={shufflePlayers}
-              className="text-xs px-3 py-1.5 rounded-lg bg-purple-500/20 text-purple-300 hover:bg-purple-500/40 transition-all"
-            >
-              🔀 随机排序
-            </button>
-          </div>
+      <div className="relative z-10 w-full max-w-sm space-y-3">
+        {/* Name */}
+        <div className="bg-white/5 border border-white/10 rounded-2xl px-4 py-3">
+          <p className="text-white/40 text-xs mb-1.5">你的名字</p>
+          <input
+            value={myName}
+            onChange={(e) => setMyName(e.target.value)}
+            placeholder="最多 6 个字"
+            maxLength={6}
+            className="w-full bg-transparent text-white text-lg font-bold placeholder-white/20 focus:outline-none"
+          />
+        </div>
 
-          {playerInputs.map((val, i) => (
-            <div key={i} className="flex gap-2 items-center">
-              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-sm font-bold flex-shrink-0">
-                {i + 1}
-              </div>
-              <input
-                value={val}
-                onChange={(e) => updatePlayer(i, e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && addPlayer()}
-                placeholder={`玩家 ${i + 1} 的名字`}
-                maxLength={8}
-                className="flex-1 bg-white/10 border border-white/15 rounded-xl px-4 py-2.5 text-white text-sm focus:border-purple-400 focus:bg-white/15 transition-all"
-              />
-              {playerInputs.length > 2 && (
-                <button
-                  onClick={() => removePlayer(i)}
-                  className="w-8 h-8 rounded-full bg-white/10 text-white/40 hover:bg-red-500/30 hover:text-red-400 transition-all flex items-center justify-center text-lg leading-none"
-                >
-                  ×
-                </button>
-              )}
-            </div>
+        {/* Tab switcher */}
+        <div className="flex bg-white/5 border border-white/10 rounded-2xl p-1">
+          {[
+            { v: 'create', label: '✨ 创建房间' },
+            { v: 'join',   label: '🚪 加入房间' },
+          ].map(({ v, label }) => (
+            <button
+              key={v}
+              onClick={() => setTab(v)}
+              className={`flex-1 py-2.5 rounded-xl text-sm font-bold transition-all ${
+                tab === v
+                  ? 'bg-gradient-to-r from-purple-600 to-pink-600 text-white shadow-lg'
+                  : 'text-white/40 hover:text-white/60'
+              }`}
+            >
+              {label}
+            </button>
           ))}
+        </div>
 
-          {playerInputs.length < 10 && (
+        {tab === 'create' && (
+          <button
+            onClick={onCreate}
+            disabled={busy}
+            className="w-full py-4 rounded-2xl bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white font-black text-lg shadow-2xl shadow-purple-500/40 hover:scale-[1.02] active:scale-[0.98] transition-all disabled:opacity-50"
+          >
+            {busy ? '⏳ 创建中...' : '开始创建 →'}
+          </button>
+        )}
+
+        {tab === 'join' && (
+          <div className="space-y-3">
+            <input
+              value={joinCode}
+              onChange={(e) => setJoinCode(e.target.value.toUpperCase().slice(0, 4))}
+              placeholder="输入 4 位房间号"
+              maxLength={4}
+              className="w-full bg-white/10 border border-white/15 rounded-2xl px-4 py-4 text-white text-center text-3xl font-black font-mono tracking-[0.4em] focus:border-purple-400 focus:outline-none transition-all uppercase placeholder-white/20"
+            />
             <button
-              onClick={addPlayer}
-              className="w-full py-2.5 rounded-xl border border-dashed border-white/20 text-white/40 text-sm hover:border-purple-400 hover:text-purple-300 transition-all"
+              onClick={onJoin}
+              disabled={busy || joinCode.length !== 4}
+              className="w-full py-4 rounded-2xl bg-gradient-to-r from-indigo-600 to-purple-700 text-white font-bold text-lg shadow-lg disabled:opacity-40 hover:scale-[1.02] active:scale-[0.98] transition-all"
             >
-              + 添加玩家
+              {busy ? '⏳ 加入中...' : '进入房间 →'}
             </button>
-          )}
-        </div>
-
-        {/* Settings */}
-        <div className="bg-white/5 backdrop-blur-sm border border-white/10 rounded-2xl p-5 space-y-4">
-          <h2 className="text-white font-bold text-sm tracking-wide">⚙️ 游戏设置</h2>
-
-          <div>
-            <p className="text-white/50 text-xs mb-2">模式</p>
-            <div className="flex gap-2">
-              {[
-                { v: 'both', label: '真心话 + 大冒险', icon: '🎭' },
-                { v: 'truth', label: '纯真心话模式', icon: '💬' },
-              ].map(({ v, label, icon }) => (
-                <button
-                  key={v}
-                  onClick={() => setGameMode(v)}
-                  className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
-                    gameMode === v
-                      ? 'bg-purple-600 text-white shadow-lg shadow-purple-500/30'
-                      : 'bg-white/10 text-white/50 hover:bg-white/20'
-                  }`}
-                >
-                  {icon} {label}
-                </button>
-              ))}
-            </div>
           </div>
+        )}
 
-          <div>
-            <p className="text-white/50 text-xs mb-2">强度</p>
-            <div className="flex gap-2">
-              {[
-                { v: 'mild', label: '温和', icon: '🌸' },
-                { v: 'spicy', label: '刺激', icon: '🔥' },
-                { v: 'random', label: '随机混合', icon: '🎲' },
-              ].map(({ v, label, icon }) => (
-                <button
-                  key={v}
-                  onClick={() => setIntensity(v)}
-                  className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
-                    intensity === v
-                      ? 'bg-pink-600 text-white shadow-lg shadow-pink-500/30'
-                      : 'bg-white/10 text-white/50 hover:bg-white/20'
-                  }`}
-                >
-                  {icon} {label}
-                </button>
-              ))}
-            </div>
+        {error && (
+          <div className="bg-red-500/20 border border-red-500/40 rounded-xl px-4 py-3 text-red-300 text-sm text-center animate-fade-in">
+            {error}
           </div>
-        </div>
-
-        {/* Start button */}
-        <button
-          onClick={onStart}
-          disabled={!canStart}
-          className={`w-full py-4 rounded-2xl font-black text-lg tracking-wide transition-all ${
-            canStart
-              ? 'bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white shadow-2xl shadow-purple-500/40 hover:shadow-purple-500/60 hover:scale-[1.02] animate-pulse-glow'
-              : 'bg-white/10 text-white/30 cursor-not-allowed'
-          }`}
-        >
-          {canStart ? `🎉 开始游戏（${valid.length} 人）` : '至少需要 2 位玩家'}
-        </button>
-
-        <p className="text-center text-white/20 text-xs">
-          游戏归游戏，别真的伤害朋友感情。💙
-        </p>
+        )}
       </div>
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  VOTING SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function VotingScreen({ question, players, votes, timeLeft, timerActive, onStartTimer, onVote, onLock }) {
-  const allVoted = players.every((p) => votes[p] !== null);
-  const circumference = 2 * Math.PI * 28;
-  const progress = timerActive ? (timeLeft / 5) * circumference : circumference;
-  const timerColor = timeLeft <= 2 ? '#f43f5e' : timeLeft <= 3 ? '#fb923c' : '#a78bfa';
+// ═════════════════════════════════════════════════════════════════════════════
+//  LOBBY PHASE
+// ═════════════════════════════════════════════════════════════════════════════
+function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copied }) {
+  const players = room?.players || {};
+  const playerList = Object.entries(players);
+  const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
+  const canStart = playerList.length >= 2;
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      {/* Question card */}
-      <div className="w-full max-w-lg mb-6">
+      {/* Room code big display */}
+      <div className="w-full max-w-sm mb-5">
+        <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 border border-purple-500/30 rounded-3xl p-6 text-center">
+          <p className="text-white/40 text-xs mb-2 tracking-widest uppercase">房间号</p>
+          <p className="text-5xl font-black font-mono tracking-[0.3em] text-white mb-4">
+            {room.roomCode || ''}
+          </p>
+          <button
+            onClick={onCopyCode}
+            className="px-6 py-2.5 rounded-xl bg-purple-600/40 text-purple-300 text-sm font-bold hover:bg-purple-600/60 transition-all"
+          >
+            {copied ? '✅ 已复制' : '📋 复制给朋友'}
+          </button>
+        </div>
+      </div>
+
+      {/* Players */}
+      <div className="w-full max-w-sm mb-4">
+        <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+          <p className="text-white/40 text-xs mb-3">
+            在线玩家（{playerList.length}/10）
+          </p>
+          <div className="space-y-2">
+            {playerList.map(([uid, p]) => (
+              <div key={uid} className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-sm font-bold">
+                  {p.name?.[0] || '?'}
+                </div>
+                <span className="text-white font-medium">{p.name}</span>
+                {uid === room.hostId && (
+                  <span className="ml-auto text-xs text-yellow-400 font-medium">👑 房主</span>
+                )}
+                {uid === myUid && uid !== room.hostId && (
+                  <span className="ml-auto text-xs text-white/30">（你）</span>
+                )}
+              </div>
+            ))}
+            {playerList.length < 2 && (
+              <p className="text-white/30 text-sm text-center py-2">
+                等待其他玩家加入...
+              </p>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Settings (host only) */}
+      {isHost && (
+        <div className="w-full max-w-sm mb-4">
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-4 space-y-4">
+            <p className="text-white/50 text-xs font-bold tracking-wide">⚙️ 游戏设置</p>
+
+            <div>
+              <p className="text-white/30 text-xs mb-2">模式</p>
+              <div className="flex gap-2">
+                {[
+                  { v: 'both', label: '🎭 真心话+大冒险' },
+                  { v: 'truth', label: '💬 纯真心话' },
+                ].map(({ v, label }) => (
+                  <button
+                    key={v}
+                    onClick={() => onSettings({ gameMode: v })}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
+                      gameMode === v
+                        ? 'bg-purple-600 text-white'
+                        : 'bg-white/10 text-white/50 hover:bg-white/20'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <p className="text-white/30 text-xs mb-2">强度</p>
+              <div className="flex gap-2">
+                {[
+                  { v: 'mild', label: '🌸 温和' },
+                  { v: 'spicy', label: '🔥 刺激' },
+                  { v: 'random', label: '🎲 随机' },
+                ].map(({ v, label }) => (
+                  <button
+                    key={v}
+                    onClick={() => onSettings({ intensity: v })}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
+                      intensity === v
+                        ? 'bg-pink-600 text-white'
+                        : 'bg-white/10 text-white/50 hover:bg-white/20'
+                    }`}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Start / Waiting */}
+      <div className="w-full max-w-sm">
+        {isHost ? (
+          <button
+            onClick={onStart}
+            disabled={!canStart}
+            className={`w-full py-4 rounded-2xl font-black text-lg transition-all ${
+              canStart
+                ? 'bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white shadow-2xl shadow-purple-500/40 hover:scale-[1.02] animate-pulse-glow'
+                : 'bg-white/10 text-white/30 cursor-not-allowed'
+            }`}
+          >
+            {canStart ? '🎉 开始游戏！' : '至少需要 2 位玩家'}
+          </button>
+        ) : (
+          <div className="text-center py-4">
+            <div className="flex items-center justify-center gap-2 text-white/40">
+              <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+              <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+              <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+            </div>
+            <p className="text-white/40 text-sm mt-2">等待房主开始游戏...</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  VOTING PHASE
+// ═════════════════════════════════════════════════════════════════════════════
+function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceReveal }) {
+  const players = room?.players || {};
+  const votes = room?.votes || {};
+  const question = room?.currentQuestion;
+  const circumference = 2 * Math.PI * 28;
+  const timerColor = timeLeft <= 2 ? '#f43f5e' : timeLeft <= 4 ? '#fb923c' : '#a78bfa';
+  const progress = (timeLeft / 7) * circumference;
+
+  return (
+    <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
+      {/* Question */}
+      <div className="w-full max-w-lg mb-5">
         <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 backdrop-blur border border-purple-500/30 rounded-3xl p-6 text-center shadow-2xl">
-          <p className="text-white/50 text-xs mb-3 tracking-widest uppercase">快速二选一 🎯</p>
+          <p className="text-white/40 text-xs mb-3 tracking-widest uppercase">快速二选一 🎯</p>
           <p className="text-white text-xl font-bold mb-5 leading-snug">{question?.question}</p>
           <div className="flex gap-3">
-            <div className="flex-1 bg-indigo-600/30 border border-indigo-400/30 rounded-2xl py-3 px-4 text-center">
+            <div className="flex-1 bg-indigo-600/30 border border-indigo-400/30 rounded-2xl py-3 px-3 text-center">
               <p className="text-indigo-300 font-bold text-sm">{question?.optionA}</p>
             </div>
-            <div className="flex-1 bg-pink-600/30 border border-pink-400/30 rounded-2xl py-3 px-4 text-center">
+            <div className="flex-1 bg-pink-600/30 border border-pink-400/30 rounded-2xl py-3 px-3 text-center">
               <p className="text-pink-300 font-bold text-sm">{question?.optionB}</p>
             </div>
           </div>
@@ -549,245 +756,262 @@ function VotingScreen({ question, players, votes, timeLeft, timerActive, onStart
       </div>
 
       {/* Timer */}
-      {!timerActive && timeLeft > 0 ? (
-        <button
-          onClick={onStartTimer}
-          className="mb-6 px-8 py-3 rounded-2xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-bold text-lg shadow-lg hover:scale-105 transition-all"
-        >
-          ▶ 开始计时
-        </button>
+      <div className="mb-5 flex items-center gap-3">
+        <svg width="64" height="64" viewBox="0 0 64 64" className="timer-ring">
+          <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="5" />
+          <circle
+            cx="32" cy="32" r="28"
+            fill="none" stroke={timerColor} strokeWidth="5" strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference - progress}
+            className="timer-ring-circle"
+            style={{ filter: `drop-shadow(0 0 8px ${timerColor})` }}
+          />
+        </svg>
+        <span className="text-5xl font-black" style={{ color: timerColor, textShadow: `0 0 20px ${timerColor}` }}>
+          {timeLeft}
+        </span>
+      </div>
+
+      {/* Other players status (show voted/not voted, NOT which option) */}
+      <div className="w-full max-w-lg mb-5">
+        <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+          <p className="text-white/30 text-xs mb-3 text-center">投票状态（结果揭晓前隐藏）</p>
+          <div className="space-y-2">
+            {Object.entries(players).map(([uid, p]) => {
+              const hasVoted = !!votes[uid];
+              const isMe = uid === myUid;
+              return (
+                <div key={uid} className="flex items-center gap-3">
+                  <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-xs font-bold flex-shrink-0">
+                    {p.name?.[0]}
+                  </div>
+                  <span className="text-white text-sm font-medium flex-1">
+                    {p.name} {isMe && <span className="text-white/30 text-xs">（你）</span>}
+                  </span>
+                  {hasVoted ? (
+                    <span className="text-xs px-2 py-1 rounded-full bg-green-500/20 text-green-400 font-medium">
+                      ✅ 已选择
+                    </span>
+                  ) : (
+                    <span className="text-xs px-2 py-1 rounded-full bg-white/10 text-white/30">
+                      ⏳ 选择中
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* My vote buttons */}
+      {!myVote ? (
+        <div className="w-full max-w-lg">
+          <p className="text-white/40 text-xs text-center mb-3">你的选择（对方看不到）</p>
+          <div className="flex gap-3">
+            <button
+              onClick={() => onVote('A')}
+              className="flex-1 py-5 rounded-2xl vote-btn-a text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95"
+            >
+              A
+            </button>
+            <button
+              onClick={() => onVote('B')}
+              className="flex-1 py-5 rounded-2xl vote-btn-b text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95"
+            >
+              B
+            </button>
+          </div>
+        </div>
       ) : (
-        <div className="mb-6 flex items-center gap-4">
-          <svg width="68" height="68" viewBox="0 0 68 68" className="timer-ring">
-            <circle cx="34" cy="34" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="5" />
-            <circle
-              cx="34" cy="34" r="28"
-              fill="none"
-              stroke={timerColor}
-              strokeWidth="5"
-              strokeLinecap="round"
-              strokeDasharray={circumference}
-              strokeDashoffset={circumference - progress}
-              className="timer-ring-circle"
-              style={{ filter: `drop-shadow(0 0 8px ${timerColor})` }}
-            />
-          </svg>
-          <span className="text-5xl font-black" style={{ color: timerColor, textShadow: `0 0 20px ${timerColor}` }}>
-            {timeLeft}
-          </span>
+        <div className="w-full max-w-lg">
+          <div className="text-center py-4 bg-white/5 border border-white/10 rounded-2xl">
+            <p className="text-white font-bold text-lg">
+              你选了 <span className={myVote === 'A' ? 'text-indigo-400' : 'text-pink-400'}>{myVote}</span>
+            </p>
+            <p className="text-white/40 text-sm mt-1">等待其他人选择...</p>
+          </div>
         </div>
       )}
 
-      {/* Player vote buttons */}
-      <div className="w-full max-w-lg grid grid-cols-1 gap-2 mb-4">
-        {players.map((player) => (
-          <div
-            key={player}
-            className="flex items-center gap-3 bg-white/5 border border-white/10 rounded-2xl px-4 py-3"
-          >
-            <div className="flex-1 flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-sm font-bold">
-                {player[0]}
-              </div>
-              <span className="text-white font-medium text-sm">{player}</span>
-              {votes[player] && (
-                <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                  votes[player] === 'A'
-                    ? 'bg-indigo-500/30 text-indigo-300'
-                    : 'bg-pink-500/30 text-pink-300'
-                }`}>
-                  已选择 {votes[player]}
-                </span>
-              )}
-            </div>
-            <div className="flex gap-2">
-              <button
-                onClick={() => onVote(player, 'A')}
-                disabled={!timerActive && timeLeft > 0}
-                className={`px-4 py-2 rounded-xl text-sm font-bold vote-btn-a text-white transition-all ${
-                  votes[player] === 'A' ? 'selected ring-2 ring-indigo-400' : ''
-                } ${!timerActive && timeLeft > 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
-              >
-                A
-              </button>
-              <button
-                onClick={() => onVote(player, 'B')}
-                disabled={!timerActive && timeLeft > 0}
-                className={`px-4 py-2 rounded-xl text-sm font-bold vote-btn-b text-white transition-all ${
-                  votes[player] === 'B' ? 'selected ring-2 ring-pink-400' : ''
-                } ${!timerActive && timeLeft > 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
-              >
-                B
-              </button>
-            </div>
-          </div>
-        ))}
-      </div>
-
-      {timerActive && (
+      {/* Host: force reveal */}
+      {isHost && (
         <button
-          onClick={onLock}
-          className="mt-2 px-6 py-2.5 rounded-xl bg-white/10 text-white/60 text-sm font-medium hover:bg-white/20 transition-all"
+          onClick={onForceReveal}
+          className="mt-4 px-5 py-2 rounded-xl bg-white/10 text-white/50 text-sm hover:bg-white/20 transition-all"
         >
-          ✅ 所有人都选好了，提前结束
+          ⚡ 提前揭晓结果
         </button>
       )}
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  RESULT SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function ResultScreen({ loser, voteBreakdown, currentQ, skipChances, skipPenalty, onSkip, onDrawCard, onAcceptPenalty, gameMode }) {
+// ═════════════════════════════════════════════════════════════════════════════
+//  REVEALING PHASE
+// ═════════════════════════════════════════════════════════════════════════════
+function RevealingPhase({ room, myUid, isLoser, players, skipChances, onDrawCard, onSkip }) {
+  const breakdown = room?.voteBreakdown;
+  const question = room?.currentQuestion;
   const [shake, setShake] = useState(false);
-  const skipsLeft = skipChances[loser] ?? 0;
 
   useEffect(() => {
-    setTimeout(() => setShake(true), 300);
-    const t = setTimeout(() => setShake(false), 900);
-    return () => clearTimeout(t);
-  }, [loser]);
+    const t = setTimeout(() => setShake(true), 200);
+    const t2 = setTimeout(() => setShake(false), 800);
+    return () => { clearTimeout(t); clearTimeout(t2); };
+  }, []);
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      {/* Vote results */}
-      {voteBreakdown && (
-        <div className="w-full max-w-lg mb-5">
+      {/* Vote breakdown */}
+      {breakdown && (
+        <div className="w-full max-w-lg mb-4">
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-            <p className="text-white/40 text-xs text-center mb-3">投票结果</p>
+            <p className="text-white/30 text-xs text-center mb-3">投票结果揭晓</p>
             <div className="flex gap-4">
               <div className="flex-1 text-center">
-                <p className="text-indigo-400 font-bold text-sm mb-1">
-                  {currentQ?.optionA} <span className="text-white/40">({voteBreakdown.a.length}票)</span>
+                <p className="text-indigo-400 font-bold text-xs mb-2">
+                  {question?.optionA}
+                  <span className="text-white/30 ml-1">({breakdown.a.length}票)</span>
                 </p>
                 <div className="flex flex-wrap gap-1 justify-center">
-                  {voteBreakdown.a.map((p) => (
-                    <span key={p} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      voteBreakdown.minority === 'A' ? 'bg-red-500/30 text-red-300' : 'bg-indigo-500/20 text-indigo-300'
-                    }`}>{p}</span>
+                  {breakdown.a.map((name) => (
+                    <span key={name} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      breakdown.minority === 'A'
+                        ? 'bg-red-500/30 text-red-300'
+                        : 'bg-indigo-500/20 text-indigo-300'
+                    }`}>{name}</span>
                   ))}
                 </div>
               </div>
               <div className="w-px bg-white/10" />
               <div className="flex-1 text-center">
-                <p className="text-pink-400 font-bold text-sm mb-1">
-                  {currentQ?.optionB} <span className="text-white/40">({voteBreakdown.b.length}票)</span>
+                <p className="text-pink-400 font-bold text-xs mb-2">
+                  {question?.optionB}
+                  <span className="text-white/30 ml-1">({breakdown.b.length}票)</span>
                 </p>
                 <div className="flex flex-wrap gap-1 justify-center">
-                  {voteBreakdown.b.map((p) => (
-                    <span key={p} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      voteBreakdown.minority === 'B' ? 'bg-red-500/30 text-red-300' : 'bg-pink-500/20 text-pink-300'
-                    }`}>{p}</span>
+                  {breakdown.b.map((name) => (
+                    <span key={name} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                      breakdown.minority === 'B'
+                        ? 'bg-red-500/30 text-red-300'
+                        : 'bg-pink-500/20 text-pink-300'
+                    }`}>{name}</span>
                   ))}
                 </div>
               </div>
             </div>
-            {voteBreakdown.minority === 'tie' && (
-              <p className="text-yellow-400 text-xs text-center mt-2">票数相同！从所有人中随机抽取</p>
+            {breakdown.minority === 'tie' && (
+              <p className="text-yellow-400 text-xs text-center mt-2">票数相同，从全体随机抽取</p>
             )}
           </div>
         </div>
       )}
 
       {/* Loser reveal */}
-      <div className={`loser-enter w-full max-w-lg mb-5 ${shake ? 'animate-shake' : ''}`}>
+      <div className={`w-full max-w-lg mb-5 loser-enter ${shake ? 'animate-shake' : ''}`}>
         <div className="bg-gradient-to-br from-red-900/50 to-orange-900/50 border border-red-500/40 rounded-3xl p-6 text-center shadow-2xl shadow-red-500/20">
-          <p className="text-red-400/70 text-xs tracking-widest uppercase mb-2">💀 本轮输家</p>
-          <div className="text-7xl mb-2">😬</div>
-          <h2 className="text-4xl font-black text-white mb-1">{loser}</h2>
-          <p className="text-white/40 text-sm">
-            {voteBreakdown?.minority === 'tie' ? '平局随机选中' : `少数派 ${voteBreakdown?.minority} 随机中签`}
-          </p>
+          <p className="text-red-400/60 text-xs tracking-widest uppercase mb-2">💀 本轮输家</p>
+          <div className="text-6xl mb-2">😬</div>
+          <h2 className="text-4xl font-black text-white">{room.loserName}</h2>
+          {isLoser && (
+            <p className="text-red-300/70 text-sm mt-2">就是你！</p>
+          )}
         </div>
       </div>
 
-      {/* Skip penalty revealed */}
-      {skipPenalty ? (
-        <div className="w-full max-w-lg mb-5 animate-bounce-in">
-          <div className="bg-gradient-to-br from-yellow-900/50 to-amber-900/50 border border-yellow-500/40 rounded-3xl p-5 text-center">
-            <p className="text-yellow-400/70 text-xs tracking-widest uppercase mb-2">🏃 跳过惩罚</p>
-            <p className="text-white text-base font-semibold leading-snug">{skipPenalty}</p>
-          </div>
-          <button
-            onClick={onAcceptPenalty}
-            className="w-full mt-3 py-4 rounded-2xl bg-gradient-to-r from-yellow-600 to-amber-600 text-white font-bold text-base shadow-lg hover:opacity-90 transition-all"
-          >
-            ✅ 完成惩罚，下一轮 →
-          </button>
-        </div>
-      ) : (
+      {/* Actions */}
+      {isLoser ? (
         <div className="w-full max-w-lg space-y-3">
           <button
             onClick={onDrawCard}
             className="w-full py-4 rounded-2xl bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white font-black text-lg shadow-2xl shadow-purple-500/30 hover:scale-[1.02] transition-all"
           >
-            🃏 抽一张{gameMode === 'truth' ? '真心话' : '题'}卡
+            🃏 抽一张题卡
           </button>
-
-          <div className="flex gap-3">
-            {skipsLeft > 0 ? (
-              <button
-                onClick={onSkip}
-                className="flex-1 py-3 rounded-2xl bg-white/10 text-white/70 font-medium text-sm hover:bg-white/20 transition-all border border-white/10"
-              >
-                🏃 使用跳过机会（剩余 {skipsLeft} 次）
-              </button>
-            ) : (
-              <div className="flex-1 py-3 rounded-2xl bg-white/5 text-white/30 font-medium text-sm text-center border border-white/5">
-                😤 没有退路了，必须回答
-              </div>
-            )}
+          {skipChances > 0 ? (
+            <button
+              onClick={onSkip}
+              className="w-full py-3 rounded-2xl bg-white/10 text-white/60 font-medium text-sm border border-white/10 hover:bg-white/20 transition-all"
+            >
+              🏃 使用跳过机会（剩余 {skipChances} 次）
+            </button>
+          ) : (
+            <div className="text-center py-2 text-white/30 text-sm">
+              😤 没有退路了，必须回答
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="text-center py-6">
+          <div className="flex items-center justify-center gap-2 mb-3">
+            <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+            <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+            <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
           </div>
+          <p className="text-white/40 text-sm">等待 {room.loserName} 选择...</p>
         </div>
       )}
     </div>
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  DECK SELECT SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function DeckSelectScreen({ loser, availableDecks, onSelect, onRandom }) {
+// ═════════════════════════════════════════════════════════════════════════════
+//  DECK SELECT PHASE
+// ═════════════════════════════════════════════════════════════════════════════
+function DeckSelectPhase({ room, isLoser, onSelectDeck, onSelectRandom }) {
+  const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
+  const ids = DECK_IDS[intensity] || DECK_IDS.random;
+  const availableDecks = decks.filter(
+    (d) => ids.includes(d.id) && (gameMode !== 'truth' || d.type !== 'dare')
+  );
+
+  if (!isLoser) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center px-4 page-enter">
+        <div className="text-5xl mb-4 animate-float">🃏</div>
+        <p className="text-white/60 text-lg font-bold text-center">{room.loserName} 正在选题卡...</p>
+        <div className="flex items-center justify-center gap-2 mt-4">
+          <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+          <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+          <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      <div className="w-full max-w-lg mb-5 text-center">
-        <p className="text-white/50 text-sm mb-1">
-          <span className="text-white font-bold">{loser}</span> 请选择题卡类型
-        </p>
-        <p className="text-white/30 text-xs">或者交给命运随机决定</p>
-      </div>
+      <p className="text-white/50 text-sm mb-2 text-center">选择你的题卡类型</p>
+      <p className="text-white/30 text-xs mb-4">或者让命运决定</p>
 
-      {/* Random button */}
       <div className="w-full max-w-lg mb-4">
         <button
-          onClick={onRandom}
-          className="w-full py-4 rounded-2xl bg-gradient-to-r from-gray-600 to-gray-800 text-white font-bold text-base border border-white/20 hover:border-purple-400 hover:shadow-lg hover:shadow-purple-500/20 transition-all"
+          onClick={onSelectRandom}
+          className="w-full py-4 rounded-2xl bg-white/10 border border-white/15 text-white font-bold text-base hover:bg-white/20 hover:border-purple-400 transition-all"
         >
           🎲 随机一张（命运决定）
         </button>
       </div>
 
-      {/* Deck grid */}
       <div className="w-full max-w-lg grid grid-cols-2 gap-3">
         {availableDecks.map((deck) => (
           <button
             key={deck.id}
-            onClick={() => onSelect(deck)}
-            className={`relative overflow-hidden rounded-2xl p-4 text-left bg-gradient-to-br ${deck.gradient} shadow-lg hover:scale-105 transition-all group`}
+            onClick={() => onSelectDeck(deck)}
+            className={`relative overflow-hidden rounded-2xl p-4 text-left bg-gradient-to-br ${deck.gradient} shadow-lg hover:scale-105 active:scale-95 transition-all group`}
             style={{ boxShadow: `0 8px 30px ${deck.glow}` }}
           >
             <div className="shimmer absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity" />
             <div className="text-3xl mb-2">{deck.icon}</div>
             <p className="text-white font-bold text-sm">{deck.name}</p>
             <p className="text-white/60 text-xs mt-0.5">{deck.description}</p>
-            <div className="mt-2 flex gap-1">
-              <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                deck.type === 'truth' ? 'bg-white/20 text-white' : 'bg-black/30 text-white/80'
-              }`}>
-                {deck.type === 'truth' ? '💬 真心话' : '🎯 大冒险'}
-              </span>
-            </div>
+            <span className={`inline-block mt-2 text-xs px-2 py-0.5 rounded-full font-medium ${
+              deck.type === 'truth' ? 'bg-white/20 text-white' : 'bg-black/30 text-white/80'
+            }`}>
+              {deck.type === 'truth' ? '💬 真心话' : '🎯 大冒险'}
+            </span>
           </button>
         ))}
       </div>
@@ -795,49 +1019,64 @@ function DeckSelectScreen({ loser, availableDecks, onSelect, onRandom }) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CARD REVEAL SCREEN
-// ═══════════════════════════════════════════════════════════════════════════════
-function CardRevealScreen({ loser, deck, card, flipped, onFlip, onDone }) {
+// ═════════════════════════════════════════════════════════════════════════════
+//  CARD REVEAL PHASE  (explanation time here)
+// ═════════════════════════════════════════════════════════════════════════════
+function CardRevealPhase({ room, myUid, players, myReady, onFlip, onReady }) {
   const cardHeight = 300;
+  const flipped = room?.cardFlipped;
+  const deck = {
+    name: room?.deckName,
+    icon: room?.deckIcon,
+    gradient: room?.deckGradient || 'from-purple-600 to-indigo-800',
+    glow: room?.deckGlow || 'rgba(139,92,246,0.5)',
+  };
+  const isSkipPenalty = room?.deckName === '跳过惩罚';
+
+  const playerList = Object.entries(players);
+  const readyCount = playerList.filter(([, p]) => p.ready).length;
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      <p className="text-white/50 text-sm mb-6 text-center">
-        <span className="text-white font-bold">{loser}</span> 抽到了 {deck?.icon} {deck?.name}
+      <p className="text-white/50 text-sm mb-1 text-center">
+        <span className="text-white font-bold">{room?.loserName}</span> 抽到了 {deck.icon} {deck.name}
       </p>
+      {isSkipPenalty && (
+        <p className="text-yellow-400/70 text-xs mb-3 text-center">跳过了！接受轻度惩罚</p>
+      )}
 
       {/* 3D flip card */}
       <div
-        className="w-full max-w-sm cursor-pointer mb-6"
+        className="w-full max-w-sm mb-5 cursor-pointer"
         style={{ height: cardHeight }}
         onClick={!flipped ? onFlip : undefined}
       >
         <div className="card-flip-container" style={{ height: cardHeight }}>
           <div className={`card-inner ${flipped ? 'flipped' : ''}`} style={{ height: cardHeight }}>
-            {/* Front face */}
+            {/* Front */}
             <div className="card-face" style={{ height: cardHeight }}>
               <div
-                className={`w-full h-full bg-gradient-to-br ${deck?.gradient} flex flex-col items-center justify-center rounded-3xl border border-white/20 shadow-2xl`}
-                style={{ boxShadow: `0 20px 60px ${deck?.glow}` }}
+                className={`w-full h-full bg-gradient-to-br ${deck.gradient} flex flex-col items-center justify-center rounded-3xl border border-white/20 shadow-2xl`}
+                style={{ boxShadow: `0 20px 60px ${deck.glow}` }}
               >
-                <div className="text-7xl mb-4 animate-float">{deck?.icon}</div>
-                <p className="text-white font-bold text-xl">{deck?.name}</p>
-                <p className="text-white/60 text-sm mt-2">点击翻牌 🃏</p>
+                <div className="text-7xl mb-4 animate-float">{deck.icon}</div>
+                <p className="text-white font-bold text-xl">{deck.name}</p>
+                <p className="text-white/60 text-sm mt-2">
+                  {flipped ? '' : '点击翻牌 🃏'}
+                </p>
               </div>
             </div>
-
-            {/* Back face */}
+            {/* Back */}
             <div className="card-face card-back-face" style={{ height: cardHeight }}>
               <div
-                className={`w-full h-full bg-gradient-to-br from-gray-900 to-gray-800 border-2 flex flex-col items-center justify-center rounded-3xl px-6 text-center`}
+                className="w-full h-full bg-gradient-to-br from-gray-900 to-gray-800 flex flex-col items-center justify-center rounded-3xl px-6 text-center"
                 style={{
-                  borderColor: deck?.glow?.replace('0.5', '0.8') ?? 'rgba(168,85,247,0.8)',
-                  boxShadow: `0 20px 60px ${deck?.glow}, inset 0 0 40px rgba(255,255,255,0.03)`,
+                  border: `2px solid ${deck.glow?.replace('0.5', '0.7') ?? 'rgba(168,85,247,0.7)'}`,
+                  boxShadow: `0 20px 60px ${deck.glow}, inset 0 0 40px rgba(255,255,255,0.03)`,
                 }}
               >
-                <div className="text-3xl mb-4">{deck?.icon}</div>
-                <p className="text-white text-lg font-semibold leading-snug">{card?.text}</p>
+                <div className="text-3xl mb-4">{deck.icon}</div>
+                <p className="text-white text-base font-semibold leading-snug">{room?.card}</p>
               </div>
             </div>
           </div>
@@ -852,17 +1091,48 @@ function CardRevealScreen({ loser, deck, card, flipped, onFlip, onDone }) {
           🃏 翻开题卡
         </button>
       ) : (
-        <div className="w-full max-w-sm space-y-3 animate-slide-up">
-          <div className="bg-white/5 border border-white/10 rounded-2xl p-4 text-center">
+        <div className="w-full max-w-sm space-y-4 animate-slide-up">
+          {/* Explanation time notice */}
+          <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 text-center">
+            <p className="text-amber-300 font-bold text-sm mb-1">⏸ 解释时间</p>
             <p className="text-white/40 text-xs">
-              {deck?.type === 'truth' ? '💬 认真回答，不许撒谎哦~' : '🎯 必须完成，加油！'}
+              {isSkipPenalty
+                ? '完成上面的惩罚后，所有人点击"下一轮"继续'
+                : room?.deckId?.startsWith('dare')
+                ? '完成大冒险后，所有人点击"下一轮"继续'
+                : '认真回答后，所有人点击"下一轮"继续'}
             </p>
           </div>
+
+          {/* Ready status */}
+          <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
+            <p className="text-white/30 text-xs mb-3 text-center">
+              已准备好 {readyCount}/{playerList.length}
+            </p>
+            <div className="flex gap-3 justify-center flex-wrap">
+              {playerList.map(([uid, p]) => (
+                <div key={uid} className="flex items-center gap-1.5">
+                  <span className={p.ready ? 'text-green-400' : 'text-white/30'}>
+                    {p.ready ? '✅' : '⏳'}
+                  </span>
+                  <span className={`text-sm font-medium ${p.ready ? 'text-white' : 'text-white/40'}`}>
+                    {p.name}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+
           <button
-            onClick={onDone}
-            className="w-full py-4 rounded-2xl bg-gradient-to-r from-green-600 to-emerald-600 text-white font-bold text-lg shadow-lg hover:opacity-90 transition-all"
+            onClick={onReady}
+            disabled={myReady}
+            className={`w-full py-4 rounded-2xl font-bold text-lg transition-all ${
+              myReady
+                ? 'bg-green-600/30 text-green-400 border border-green-500/30 cursor-default'
+                : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white shadow-lg hover:opacity-90 hover:scale-[1.02]'
+            }`}
           >
-            ✅ 已完成，下一轮 →
+            {myReady ? '✅ 我已准备好，等待其他人...' : '✅ 说完了，下一轮 →'}
           </button>
         </div>
       )}
@@ -870,123 +1140,43 @@ function CardRevealScreen({ loser, deck, card, flipped, onFlip, onDone }) {
   );
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
 //  HISTORY MODAL
-// ═══════════════════════════════════════════════════════════════════════════════
+// ═════════════════════════════════════════════════════════════════════════════
 function HistoryModal({ history, onClose }) {
+  const entries = Object.values(history).sort((a, b) => a.round - b.round);
+
   return (
     <div
       className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-4"
       onClick={onClose}
     >
       <div
-        className="bg-gray-950 border border-white/15 rounded-3xl w-full max-w-lg max-h-[80vh] overflow-hidden flex flex-col"
+        className="bg-gray-950 border border-white/15 rounded-3xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
-          <h3 className="text-white font-bold text-base">📋 本局历史记录</h3>
+          <h3 className="text-white font-bold">📋 本局历史</h3>
           <button onClick={onClose} className="text-white/40 hover:text-white/80 text-2xl leading-none">×</button>
         </div>
-
         <div className="overflow-y-auto flex-1 p-4 space-y-3">
-          {history.length === 0 ? (
+          {entries.length === 0 ? (
             <p className="text-white/30 text-center py-8 text-sm">还没有记录</p>
           ) : (
-            history.map((entry) => (
-              <div key={entry.round} className="bg-white/5 border border-white/10 rounded-2xl p-4">
-                <div className="flex items-center gap-2 mb-2">
+            entries.map((e) => (
+              <div key={e.round} className="bg-white/5 border border-white/10 rounded-2xl p-4">
+                <div className="flex items-center gap-2 mb-1.5">
                   <span className="text-xs font-bold px-2 py-0.5 bg-purple-500/30 text-purple-300 rounded-full">
-                    第 {entry.round} 轮
+                    第 {e.round} 轮
                   </span>
-                  <span className={`text-xs font-medium ${entry.skipped ? 'text-yellow-400' : 'text-red-400'}`}>
-                    输家：{entry.loser} {entry.skipped ? '🏃' : ''}
-                  </span>
+                  <span className="text-red-400 text-xs font-medium">输家：{e.loserName}</span>
                 </div>
-                <p className="text-white/50 text-xs mb-1">
-                  问题：{entry.question}（A:{entry.voteA.join('、') || '无'} / B:{entry.voteB.join('、') || '无'}）
-                </p>
-                <p className="text-white/80 text-sm font-medium">
-                  {entry.deckName}：{entry.card}
+                <p className="text-white/40 text-xs mb-1">
+                  {e.question} — A: {(e.voteA || []).join('、') || '无'} / B: {(e.voteB || []).join('、') || '无'}
                 </p>
               </div>
             ))
           )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  SETTINGS MODAL
-// ═══════════════════════════════════════════════════════════════════════════════
-function SettingsModal({ gameMode, setGameMode, intensity, setIntensity, onClose }) {
-  return (
-    <div
-      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-gray-950 border border-white/15 rounded-3xl w-full max-w-lg overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
-          <h3 className="text-white font-bold text-base">⚙️ 游戏设置</h3>
-          <button onClick={onClose} className="text-white/40 hover:text-white/80 text-2xl leading-none">×</button>
-        </div>
-
-        <div className="p-5 space-y-5">
-          <div>
-            <p className="text-white/50 text-xs mb-3 tracking-wide">游戏模式</p>
-            <div className="flex gap-2">
-              {[
-                { v: 'both', label: '🎭 真心话 + 大冒险' },
-                { v: 'truth', label: '💬 纯真心话模式' },
-              ].map(({ v, label }) => (
-                <button
-                  key={v}
-                  onClick={() => setGameMode(v)}
-                  className={`flex-1 py-3 rounded-xl text-sm font-medium transition-all ${
-                    gameMode === v
-                      ? 'bg-purple-600 text-white shadow-lg shadow-purple-500/30'
-                      : 'bg-white/10 text-white/50 hover:bg-white/20'
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div>
-            <p className="text-white/50 text-xs mb-3 tracking-wide">题目强度</p>
-            <div className="flex gap-2">
-              {[
-                { v: 'mild', label: '🌸 温和' },
-                { v: 'spicy', label: '🔥 刺激' },
-                { v: 'random', label: '🎲 随机混合' },
-              ].map(({ v, label }) => (
-                <button
-                  key={v}
-                  onClick={() => setIntensity(v)}
-                  className={`flex-1 py-3 rounded-xl text-sm font-medium transition-all ${
-                    intensity === v
-                      ? 'bg-pink-600 text-white shadow-lg shadow-pink-500/30'
-                      : 'bg-white/10 text-white/50 hover:bg-white/20'
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <button
-            onClick={onClose}
-            className="w-full py-3 rounded-xl bg-white/10 text-white/70 font-medium hover:bg-white/20 transition-all"
-          >
-            保存并关闭
-          </button>
         </div>
       </div>
     </div>
