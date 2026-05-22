@@ -1,15 +1,13 @@
 // ============================================================================
-//  真心话大冒险 · 联机版
+//  真心话大冒险 · 联机版（Supabase Realtime）
 // ============================================================================
 import React, { useState, useEffect, useRef } from 'react';
-import { ref, set, update, get, onValue } from 'firebase/database';
-import { db } from './firebase';
+import { supabase } from './supabase';
 import { quickQuestions, decks, skipPenalties } from './data/questions';
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-// Stable player ID per browser session
 const myUid = (() => {
   let id = sessionStorage.getItem('tod_uid');
   if (!id) {
@@ -30,7 +28,7 @@ const DECK_IDS = {
   random: ['secret', 'ambiguous', 'explosive', 'friends', 'ice', 'dare-light', 'dare-hot'],
 };
 
-const VOTE_MS = 7000; // 7-second voting window
+const VOTE_MS = 7000;
 
 // ── Stars Background ─────────────────────────────────────────────────────────
 function Stars() {
@@ -44,96 +42,84 @@ function Stars() {
       del: (Math.random() * 4).toFixed(1),
     }))
   ).current;
-
   return (
     <div className="stars-bg" aria-hidden>
       {stars.map((s) => (
-        <div
-          key={s.id}
-          className="star"
-          style={{
-            left: `${s.x}%`, top: `${s.y}%`,
-            width: s.size, height: s.size,
-            '--duration': `${s.dur}s`, '--delay': `${s.del}s`,
-          }}
-        />
+        <div key={s.id} className="star" style={{
+          left: `${s.x}%`, top: `${s.y}%`,
+          width: s.size, height: s.size,
+          '--duration': `${s.dur}s`, '--delay': `${s.del}s`,
+        }} />
       ))}
     </div>
   );
 }
 
-// ── Firebase Setup Guard ──────────────────────────────────────────────────────
-function FirebaseNotConfigured() {
-  return (
-    <div className="min-h-screen bg-party relative flex flex-col items-center justify-center px-6 text-center">
-      <Stars />
-      <div className="relative z-10 max-w-sm space-y-4">
-        <div className="text-5xl">🔧</div>
-        <h2 className="text-white font-black text-2xl">需要配置 Firebase</h2>
-        <div className="bg-white/5 border border-white/15 rounded-2xl p-5 text-left space-y-2 text-sm">
-          <p className="text-white/70 font-bold mb-3">快速设置步骤：</p>
-          <p className="text-white/60">1. 访问 <span className="text-purple-400">console.firebase.google.com</span></p>
-          <p className="text-white/60">2. 新建项目 → 构建 → Realtime Database → 创建（测试模式）</p>
-          <p className="text-white/60">3. 项目设置 → 您的应用 → 注册 Web 应用</p>
-          <p className="text-white/60">4. 复制 firebaseConfig 到 <span className="text-purple-400">src/firebase.js</span></p>
-        </div>
-        <p className="text-white/30 text-xs">配置完成后刷新页面即可使用</p>
-      </div>
-    </div>
-  );
-}
+// ── Supabase helpers ─────────────────────────────────────────────────────────
+const getRoom = async (code) => {
+  const { data, error } = await supabase
+    .from('rooms').select('state').eq('code', code).single();
+  if (error) return null;
+  return data?.state ?? null;
+};
 
-// ── App (main) ────────────────────────────────────────────────────────────────
+const setRoomState = async (code, state) => {
+  await supabase.from('rooms').update({ state }).eq('code', code);
+};
+
+// ── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  // Check Firebase config
-  try {
-    const testRef = ref(db, '.info/connected');
-    void testRef;
-  } catch {
-    return <FirebaseNotConfigured />;
-  }
-
-  const [screen, setScreen] = useState('home'); // 'home' | 'game'
-  const [roomCode, setRoomCode] = useState('');
-  const [room, setRoom] = useState(null);
-  const [myName, setMyName] = useState(() => sessionStorage.getItem('tod_name') || '');
-  const [joinCode, setJoinCode] = useState('');
-  const [error, setError] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [timeLeft, setTimeLeft] = useState(0);
+  const [screen, setScreen]       = useState('home');
+  const [roomCode, setRoomCode]   = useState('');
+  const [room, setRoom]           = useState(null);
+  const [myName, setMyName]       = useState(() => sessionStorage.getItem('tod_name') || '');
+  const [joinCode, setJoinCode]   = useState('');
+  const [error, setError]         = useState('');
+  const [busy, setBusy]           = useState(false);
+  const [timeLeft, setTimeLeft]   = useState(0);
   const [showHistory, setShowHistory] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const [fbError, setFbError] = useState(false);
+  const [copied, setCopied]       = useState(false);
+  const [sbError, setSbError]     = useState(false);
 
   const revealFired = useRef(false);
-  const nextFired = useRef(false);
-  const timerRef = useRef(null);
+  const nextFired   = useRef(false);
+  const timerRef    = useRef(null);
 
-  const players = room?.players || {};
-  const isHost = room?.hostId === myUid;
-  const isLoser = room?.loser === myUid;
-  const myVote = room?.votes?.[myUid] ?? null;
+  const players     = room?.players    || {};
+  const isHost      = room?.hostId     === myUid;
+  const isLoser     = room?.loser      === myUid;
+  const myVote      = room?.votes?.[myUid] ?? null;
   const playerCount = Object.keys(players).length;
-  const votedCount = Object.values(room?.votes || {}).filter(Boolean).length;
-  const allVoted = playerCount > 0 && votedCount >= playerCount;
-  const myReady = players[myUid]?.ready ?? false;
+  const votedCount  = Object.values(room?.votes || {}).filter(Boolean).length;
+  const allVoted    = playerCount > 0 && votedCount >= playerCount;
+  const myReady     = players[myUid]?.ready ?? false;
 
-  // ── Firebase subscription ─────────────────────────────────────────────────
+  // ── Supabase Realtime subscription ───────────────────────────────────────
   useEffect(() => {
     if (!roomCode) return;
-    const rRef = ref(db, `rooms/${roomCode}`);
-    const unsub = onValue(
-      rRef,
-      (snap) => {
-        if (!snap.exists()) { setScreen('home'); setRoomCode(''); return; }
-        setRoom(snap.val());
-      },
-      () => setFbError(true)
-    );
-    return () => unsub();
+
+    // Initial fetch
+    getRoom(roomCode).then((state) => {
+      if (!state) { setScreen('home'); setRoomCode(''); return; }
+      setRoom(state);
+    });
+
+    // Realtime listener
+    const channel = supabase
+      .channel(`room-${roomCode}`)
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `code=eq.${roomCode}` },
+        (payload) => { if (payload.new?.state) setRoom(payload.new.state); }
+      )
+      .subscribe((status) => {
+        if (status === 'CHANNEL_ERROR') setSbError(true);
+      });
+
+    return () => { supabase.removeChannel(channel); };
   }, [roomCode]);
 
-  // ── Timer (local computation from server deadline) ────────────────────────
+  // ── Timer ────────────────────────────────────────────────────────────────
   useEffect(() => {
     clearInterval(timerRef.current);
     if (!room?.voteDeadline || room?.phase !== 'voting') { setTimeLeft(0); return; }
@@ -153,15 +139,15 @@ export default function App() {
     }
   }, [timeLeft, allVoted, isHost, room?.phase, room?.votesRevealed]);
 
-  // Reset guards when a new voting phase begins
+  // Reset guards on new voting phase
   useEffect(() => {
     if (room?.phase === 'voting') {
       revealFired.current = false;
-      nextFired.current = false;
+      nextFired.current   = false;
     }
   }, [room?.phase]);
 
-  // ── Host: advance to next round when all players are ready ────────────────
+  // ── Host: advance when all ready ─────────────────────────────────────────
   useEffect(() => {
     if (!isHost || room?.phase !== 'card-reveal' || nextFired.current) return;
     const vals = Object.values(players);
@@ -172,9 +158,7 @@ export default function App() {
   }, [players, room?.phase, isHost]);
 
   // Save name
-  useEffect(() => {
-    if (myName) sessionStorage.setItem('tod_name', myName);
-  }, [myName]);
+  useEffect(() => { if (myName) sessionStorage.setItem('tod_name', myName); }, [myName]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
 
@@ -186,10 +170,10 @@ export default function App() {
       let code;
       for (let i = 0; i < 10; i++) {
         code = genCode();
-        const s = await get(ref(db, `rooms/${code}/hostId`));
-        if (!s.exists()) break;
+        const { data } = await supabase.from('rooms').select('code').eq('code', code).single();
+        if (!data) break;
       }
-      await set(ref(db, `rooms/${code}`), {
+      const initialState = {
         hostId: myUid,
         phase: 'lobby',
         round: 0,
@@ -200,11 +184,14 @@ export default function App() {
         votesRevealed: false,
         usedQuestionIds: {},
         usedCardIds: {},
-      });
+        history: {},
+      };
+      const { error: insertErr } = await supabase.from('rooms').insert({ code, state: initialState });
+      if (insertErr) throw insertErr;
       setRoomCode(code);
       setScreen('game');
-    } catch (e) {
-      setError('创建失败，请检查 Firebase 配置和网络');
+    } catch {
+      setError('创建失败，请检查 Supabase 配置和 SQL 是否已执行');
     }
     setBusy(false);
   };
@@ -213,17 +200,15 @@ export default function App() {
     const name = myName.trim();
     if (!name) { setError('请先输入你的名字'); return; }
     const code = joinCode.trim().toUpperCase();
-    if (code.length !== 4) { setError('房间号是4位字母/数字'); return; }
+    if (code.length !== 4) { setError('房间号是4位'); return; }
     setBusy(true); setError('');
     try {
-      const snap = await get(ref(db, `rooms/${code}`));
-      if (!snap.exists()) { setError('找不到这个房间，检查一下房间号'); setBusy(false); return; }
-      const d = snap.val();
-      if (d.phase !== 'lobby') { setError('游戏已经开始了，加入不了'); setBusy(false); return; }
-      if (Object.keys(d.players || {}).length >= 10) { setError('房间满了'); setBusy(false); return; }
-      await update(ref(db, `rooms/${code}/players/${myUid}`), {
-        name, skipChances: 1, ready: false,
-      });
+      const state = await getRoom(code);
+      if (!state) { setError('找不到这个房间，检查一下房间号'); setBusy(false); return; }
+      if (state.phase !== 'lobby') { setError('游戏已经开始了，加入不了'); setBusy(false); return; }
+      if (Object.keys(state.players || {}).length >= 10) { setError('房间满了'); setBusy(false); return; }
+      // Atomic join via RPC
+      await supabase.rpc('join_room', { p_code: code, p_uid: myUid, p_name: name });
       setRoomCode(code);
       setScreen('game');
     } catch {
@@ -240,41 +225,42 @@ export default function App() {
     if (!pool.length) pool = [...quickQuestions];
     const q = pick(pool);
 
-    const resets = {};
-    Object.keys(players).forEach((uid) => { resets[`players/${uid}/ready`] = false; });
+    const newPlayers = Object.fromEntries(
+      Object.entries(room?.players || {}).map(([uid, p]) => [uid, { ...p, ready: false }])
+    );
 
-    await update(ref(db, `rooms/${roomCode}`), {
+    const newState = {
+      ...room,
       phase: 'voting',
       round: first ? 1 : (room?.round || 0) + 1,
       currentQuestion: q,
       votes: {},
       votesRevealed: false,
-      loser: null,
-      loserName: null,
-      voteBreakdown: null,
+      loser: null, loserName: null, voteBreakdown: null,
       deckId: null, deckName: null, deckIcon: null, deckGradient: null, deckGlow: null,
-      card: null, cardFlipped: false, skipPenalty: null,
+      card: null, cardFlipped: false,
       voteDeadline: Date.now() + VOTE_MS,
-      [`usedQuestionIds/${q.id}`]: true,
-      ...resets,
-    });
+      usedQuestionIds: { ...(room?.usedQuestionIds || {}), [q.id]: true },
+      players: newPlayers,
+    };
+    await setRoomState(roomCode, newState);
   };
 
+  // Atomic vote via RPC (multiple players can vote simultaneously)
   const doVote = async (choice) => {
     if (myVote || room?.phase !== 'voting') return;
-    await update(ref(db, `rooms/${roomCode}/votes`), { [myUid]: choice });
+    await supabase.rpc('cast_vote', { p_code: roomCode, p_uid: myUid, p_choice: choice });
   };
 
   const doReveal = async () => {
     if (!isHost) return;
-    const snap = await get(ref(db, `rooms/${roomCode}`));
-    const d = snap.val();
+    // Fetch fresh state to avoid stale closure
+    const d = await getRoom(roomCode);
     if (!d || d.phase !== 'voting' || d.votesRevealed) return;
 
-    const votes = d.votes || {};
+    const votes   = d.votes || {};
     const allUids = Object.keys(d.players || {});
-
-    const final = { ...votes };
+    const final   = { ...votes };
     allUids.forEach((uid) => { if (!final[uid]) final[uid] = pick(['A', 'B']); });
 
     const aUids = allUids.filter((u) => final[u] === 'A');
@@ -284,24 +270,22 @@ export default function App() {
     else if (aUids.length < bUids.length) { danger = aUids; minority = 'A'; }
     else { danger = bUids; minority = 'B'; }
 
-    const loserUid = pick(danger);
+    const loserUid  = pick(danger);
     const loserName = d.players[loserUid]?.name || '???';
-    const aNames = aUids.map((u) => d.players[u]?.name || u);
-    const bNames = bUids.map((u) => d.players[u]?.name || u);
+    const aNames    = aUids.map((u) => d.players[u]?.name || u);
+    const bNames    = bUids.map((u) => d.players[u]?.name || u);
 
-    await update(ref(db, `rooms/${roomCode}`), {
+    await setRoomState(roomCode, {
+      ...d,
       votes: final,
       votesRevealed: true,
       loser: loserUid,
       loserName,
       voteBreakdown: { a: aNames, b: bNames, minority },
       phase: 'revealing',
-      [`history/${d.round}`]: {
-        round: d.round,
-        question: d.currentQuestion?.question,
-        loserName,
-        voteA: aNames,
-        voteB: bNames,
+      history: {
+        ...(d.history || {}),
+        [d.round]: { round: d.round, question: d.currentQuestion?.question, loserName, voteA: aNames, voteB: bNames },
       },
     });
   };
@@ -313,7 +297,7 @@ export default function App() {
   };
 
   const doGoToDeckSelect = async () => {
-    await update(ref(db, `rooms/${roomCode}`), { phase: 'deck-select' });
+    await setRoomState(roomCode, { ...room, phase: 'deck-select' });
   };
 
   const doSelectDeck = async (deck) => {
@@ -321,21 +305,23 @@ export default function App() {
     let pool = deck.questions.filter((q) => !usedCards.includes(q.id));
     if (!pool.length) pool = [...deck.questions];
     const card = pick(pool);
-    await update(ref(db, `rooms/${roomCode}`), {
+    await setRoomState(roomCode, {
+      ...room,
       phase: 'card-reveal',
       deckId: deck.id, deckName: deck.name, deckIcon: deck.icon,
       deckGradient: deck.gradient, deckGlow: deck.glow,
       card: card.text, cardFlipped: false,
-      [`usedCardIds/${deck.id}/${card.id}`]: true,
+      usedCardIds: {
+        ...(room?.usedCardIds || {}),
+        [deck.id]: { ...(room?.usedCardIds?.[deck.id] || {}), [card.id]: true },
+      },
     });
   };
 
   const doSelectRandom = async () => {
     const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
-    const ids = DECK_IDS[intensity] || DECK_IDS.random;
-    const avail = decks.filter(
-      (d) => ids.includes(d.id) && (gameMode !== 'truth' || d.type !== 'dare')
-    );
+    const ids   = DECK_IDS[intensity] || DECK_IDS.random;
+    const avail = decks.filter((d) => ids.includes(d.id) && (gameMode !== 'truth' || d.type !== 'dare'));
     if (avail.length) await doSelectDeck(pick(avail));
   };
 
@@ -343,8 +329,13 @@ export default function App() {
     const chances = players[myUid]?.skipChances ?? 0;
     if (chances <= 0) return;
     const penalty = pick(skipPenalties);
-    await update(ref(db, `rooms/${roomCode}`), {
-      [`players/${myUid}/skipChances`]: chances - 1,
+    const newPlayers = {
+      ...room.players,
+      [myUid]: { ...room.players[myUid], skipChances: chances - 1 },
+    };
+    await setRoomState(roomCode, {
+      ...room,
+      players: newPlayers,
       phase: 'card-reveal',
       card: penalty, cardFlipped: true,
       deckName: '跳过惩罚', deckIcon: '🏃',
@@ -355,16 +346,20 @@ export default function App() {
 
   const doFlip = async () => {
     if (room?.cardFlipped) return;
-    await update(ref(db, `rooms/${roomCode}`), { cardFlipped: true });
+    await setRoomState(roomCode, { ...room, cardFlipped: true });
   };
 
+  // Atomic ready via RPC (both players can click simultaneously)
   const doReady = async () => {
     if (myReady) return;
-    await update(ref(db, `rooms/${roomCode}/players/${myUid}`), { ready: true });
+    await supabase.rpc('mark_player_ready', { p_code: roomCode, p_uid: myUid });
   };
 
   const doUpdateSettings = async (settings) => {
-    await update(ref(db, `rooms/${roomCode}/settings`), settings);
+    await setRoomState(roomCode, {
+      ...room,
+      settings: { ...room.settings, ...settings },
+    });
   };
 
   const doCopyCode = () => {
@@ -375,20 +370,22 @@ export default function App() {
 
   const doLeave = () => {
     if (room?.phase === 'lobby') {
-      update(ref(db, `rooms/${roomCode}/players`), { [myUid]: null });
+      const newPlayers = { ...room.players };
+      delete newPlayers[myUid];
+      setRoomState(roomCode, { ...room, players: newPlayers });
     }
     setScreen('home'); setRoomCode(''); setRoom(null); setError('');
   };
 
   // ── Render ────────────────────────────────────────────────────────────────
 
-  if (fbError) {
+  if (sbError) {
     return (
       <div className="min-h-screen bg-party flex items-center justify-center px-6 text-center">
         <Stars />
-        <div className="relative z-10">
-          <p className="text-red-400 text-lg font-bold mb-2">Firebase 连接失败</p>
-          <p className="text-white/40 text-sm">请检查 src/firebase.js 配置</p>
+        <div className="relative z-10 space-y-2">
+          <p className="text-red-400 text-lg font-bold">Supabase 连接失败</p>
+          <p className="text-white/40 text-sm">请检查 src/supabase.js 里的 URL 和 Key</p>
         </div>
       </div>
     );
@@ -409,7 +406,7 @@ export default function App() {
     return (
       <div className="min-h-screen bg-party flex items-center justify-center">
         <Stars />
-        <p className="text-white/40 z-10">连接中...</p>
+        <p className="text-white/40 z-10 animate-pulse">连接中...</p>
       </div>
     );
   }
@@ -420,12 +417,8 @@ export default function App() {
     <div className="min-h-screen bg-party relative flex flex-col">
       <Stars />
 
-      {/* Header */}
       <header className="flex items-center justify-between px-4 pt-4 pb-2 relative z-10">
-        <button
-          onClick={doLeave}
-          className="text-white/40 hover:text-white/70 text-sm transition-all"
-        >
+        <button onClick={doLeave} className="text-white/40 hover:text-white/70 text-sm transition-all">
           ← 退出
         </button>
         <div className="flex items-center gap-2">
@@ -450,39 +443,11 @@ export default function App() {
       </header>
 
       <div className="flex-1 flex flex-col relative z-10">
-        {phase === 'lobby' && (
-          <LobbyPhase
-            room={room} myUid={myUid} isHost={isHost}
-            onStart={doStart} onSettings={doUpdateSettings}
-            onCopyCode={doCopyCode} copied={copied}
-          />
-        )}
-        {phase === 'voting' && (
-          <VotingPhase
-            room={room} myUid={myUid} myVote={myVote}
-            timeLeft={timeLeft} isHost={isHost}
-            onVote={doVote} onForceReveal={doForceReveal}
-          />
-        )}
-        {phase === 'revealing' && (
-          <RevealingPhase
-            room={room} myUid={myUid} isLoser={isLoser}
-            players={players} skipChances={players[myUid]?.skipChances ?? 0}
-            onDrawCard={doGoToDeckSelect} onSkip={doSkip}
-          />
-        )}
-        {phase === 'deck-select' && (
-          <DeckSelectPhase
-            room={room} myUid={myUid} isLoser={isLoser}
-            onSelectDeck={doSelectDeck} onSelectRandom={doSelectRandom}
-          />
-        )}
-        {phase === 'card-reveal' && (
-          <CardRevealPhase
-            room={room} myUid={myUid} players={players}
-            myReady={myReady} onFlip={doFlip} onReady={doReady}
-          />
-        )}
+        {phase === 'lobby'       && <LobbyPhase     room={room} myUid={myUid} isHost={isHost} onStart={doStart} onSettings={doUpdateSettings} onCopyCode={doCopyCode} copied={copied} />}
+        {phase === 'voting'      && <VotingPhase    room={room} myUid={myUid} myVote={myVote} timeLeft={timeLeft} isHost={isHost} onVote={doVote} onForceReveal={doForceReveal} />}
+        {phase === 'revealing'   && <RevealingPhase room={room} myUid={myUid} isLoser={isLoser} players={players} skipChances={players[myUid]?.skipChances ?? 0} onDrawCard={doGoToDeckSelect} onSkip={doSkip} />}
+        {phase === 'deck-select' && <DeckSelectPhase room={room} isLoser={isLoser} onSelectDeck={doSelectDeck} onSelectRandom={doSelectRandom} />}
+        {phase === 'card-reveal' && <CardRevealPhase room={room} myUid={myUid} players={players} myReady={myReady} onFlip={doFlip} onReady={doReady} />}
       </div>
 
       {showHistory && (
@@ -500,7 +465,7 @@ export default function App() {
 //  HOME SCREEN
 // ═════════════════════════════════════════════════════════════════════════════
 function HomeScreen({ myName, setMyName, joinCode, setJoinCode, error, busy, onCreate, onJoin }) {
-  const [tab, setTab] = useState('create'); // 'create' | 'join'
+  const [tab, setTab] = useState('create');
 
   return (
     <div className="min-h-screen bg-party relative flex flex-col items-center justify-center px-4 py-8">
@@ -527,7 +492,7 @@ function HomeScreen({ myName, setMyName, joinCode, setJoinCode, error, busy, onC
           />
         </div>
 
-        {/* Tab switcher */}
+        {/* Tab */}
         <div className="flex bg-white/5 border border-white/10 rounded-2xl p-1">
           {[
             { v: 'create', label: '✨ 创建房间' },
@@ -590,20 +555,18 @@ function HomeScreen({ myName, setMyName, joinCode, setJoinCode, error, busy, onC
 //  LOBBY PHASE
 // ═════════════════════════════════════════════════════════════════════════════
 function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copied }) {
-  const players = room?.players || {};
+  const players    = room?.players || {};
   const playerList = Object.entries(players);
   const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
-  const canStart = playerList.length >= 2;
+  const canStart   = playerList.length >= 2;
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      {/* Room code big display */}
+      {/* Room code */}
       <div className="w-full max-w-sm mb-5">
         <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 border border-purple-500/30 rounded-3xl p-6 text-center">
           <p className="text-white/40 text-xs mb-2 tracking-widest uppercase">房间号</p>
-          <p className="text-5xl font-black font-mono tracking-[0.3em] text-white mb-4">
-            {room.roomCode || ''}
-          </p>
+          <p className="text-5xl font-black font-mono tracking-[0.3em] text-white mb-4">{room?.code ?? '----'}</p>
           <button
             onClick={onCopyCode}
             className="px-6 py-2.5 rounded-xl bg-purple-600/40 text-purple-300 text-sm font-bold hover:bg-purple-600/60 transition-all"
@@ -616,28 +579,20 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
       {/* Players */}
       <div className="w-full max-w-sm mb-4">
         <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-          <p className="text-white/40 text-xs mb-3">
-            在线玩家（{playerList.length}/10）
-          </p>
+          <p className="text-white/40 text-xs mb-3">在线玩家（{playerList.length}/10）</p>
           <div className="space-y-2">
             {playerList.map(([uid, p]) => (
               <div key={uid} className="flex items-center gap-3">
                 <div className="w-8 h-8 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-sm font-bold">
                   {p.name?.[0] || '?'}
                 </div>
-                <span className="text-white font-medium">{p.name}</span>
-                {uid === room.hostId && (
-                  <span className="ml-auto text-xs text-yellow-400 font-medium">👑 房主</span>
-                )}
-                {uid === myUid && uid !== room.hostId && (
-                  <span className="ml-auto text-xs text-white/30">（你）</span>
-                )}
+                <span className="text-white font-medium flex-1">{p.name}</span>
+                {uid === room.hostId && <span className="text-xs text-yellow-400 font-medium">👑 房主</span>}
+                {uid === myUid && uid !== room.hostId && <span className="text-xs text-white/30">（你）</span>}
               </div>
             ))}
             {playerList.length < 2 && (
-              <p className="text-white/30 text-sm text-center py-2">
-                等待其他玩家加入...
-              </p>
+              <p className="text-white/30 text-sm text-center py-2">等待其他玩家加入...</p>
             )}
           </div>
         </div>
@@ -648,46 +603,23 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
         <div className="w-full max-w-sm mb-4">
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4 space-y-4">
             <p className="text-white/50 text-xs font-bold tracking-wide">⚙️ 游戏设置</p>
-
             <div>
               <p className="text-white/30 text-xs mb-2">模式</p>
               <div className="flex gap-2">
-                {[
-                  { v: 'both', label: '🎭 真心话+大冒险' },
-                  { v: 'truth', label: '💬 纯真心话' },
-                ].map(({ v, label }) => (
-                  <button
-                    key={v}
-                    onClick={() => onSettings({ gameMode: v })}
-                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
-                      gameMode === v
-                        ? 'bg-purple-600 text-white'
-                        : 'bg-white/10 text-white/50 hover:bg-white/20'
-                    }`}
-                  >
+                {[{ v: 'both', label: '🎭 真心话+大冒险' }, { v: 'truth', label: '💬 纯真心话' }].map(({ v, label }) => (
+                  <button key={v} onClick={() => onSettings({ gameMode: v })}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${gameMode === v ? 'bg-purple-600 text-white' : 'bg-white/10 text-white/50 hover:bg-white/20'}`}>
                     {label}
                   </button>
                 ))}
               </div>
             </div>
-
             <div>
               <p className="text-white/30 text-xs mb-2">强度</p>
               <div className="flex gap-2">
-                {[
-                  { v: 'mild', label: '🌸 温和' },
-                  { v: 'spicy', label: '🔥 刺激' },
-                  { v: 'random', label: '🎲 随机' },
-                ].map(({ v, label }) => (
-                  <button
-                    key={v}
-                    onClick={() => onSettings({ intensity: v })}
-                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${
-                      intensity === v
-                        ? 'bg-pink-600 text-white'
-                        : 'bg-white/10 text-white/50 hover:bg-white/20'
-                    }`}
-                  >
+                {[{ v: 'mild', label: '🌸 温和' }, { v: 'spicy', label: '🔥 刺激' }, { v: 'random', label: '🎲 随机' }].map(({ v, label }) => (
+                  <button key={v} onClick={() => onSettings({ intensity: v })}
+                    className={`flex-1 py-2 rounded-xl text-xs font-medium transition-all ${intensity === v ? 'bg-pink-600 text-white' : 'bg-white/10 text-white/50 hover:bg-white/20'}`}>
                     {label}
                   </button>
                 ))}
@@ -697,9 +629,9 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
         </div>
       )}
 
-      {/* Start / Waiting */}
-      <div className="w-full max-w-sm">
-        {isHost ? (
+      {/* Start */}
+      {isHost ? (
+        <div className="w-full max-w-sm">
           <button
             onClick={onStart}
             disabled={!canStart}
@@ -711,17 +643,17 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
           >
             {canStart ? '🎉 开始游戏！' : '至少需要 2 位玩家'}
           </button>
-        ) : (
-          <div className="text-center py-4">
-            <div className="flex items-center justify-center gap-2 text-white/40">
-              <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-              <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-              <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-            </div>
-            <p className="text-white/40 text-sm mt-2">等待房主开始游戏...</p>
+        </div>
+      ) : (
+        <div className="text-center py-4">
+          <div className="flex items-center justify-center gap-2">
+            {['0ms','150ms','300ms'].map((d, i) => (
+              <div key={i} className={`w-2 h-2 rounded-full animate-bounce ${['bg-purple-400','bg-pink-400','bg-orange-400'][i]}`} style={{ animationDelay: d }} />
+            ))}
           </div>
-        )}
-      </div>
+          <p className="text-white/40 text-sm mt-2">等待房主开始游戏...</p>
+        </div>
+      )}
     </div>
   );
 }
@@ -730,18 +662,18 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
 //  VOTING PHASE
 // ═════════════════════════════════════════════════════════════════════════════
 function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceReveal }) {
-  const players = room?.players || {};
-  const votes = room?.votes || {};
-  const question = room?.currentQuestion;
+  const players     = room?.players || {};
+  const votes       = room?.votes   || {};
+  const question    = room?.currentQuestion;
   const circumference = 2 * Math.PI * 28;
-  const timerColor = timeLeft <= 2 ? '#f43f5e' : timeLeft <= 4 ? '#fb923c' : '#a78bfa';
-  const progress = (timeLeft / 7) * circumference;
+  const timerColor  = timeLeft <= 2 ? '#f43f5e' : timeLeft <= 4 ? '#fb923c' : '#a78bfa';
+  const progress    = (timeLeft / 7) * circumference;
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
       {/* Question */}
       <div className="w-full max-w-lg mb-5">
-        <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 backdrop-blur border border-purple-500/30 rounded-3xl p-6 text-center shadow-2xl">
+        <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 border border-purple-500/30 rounded-3xl p-6 text-center shadow-2xl">
           <p className="text-white/40 text-xs mb-3 tracking-widest uppercase">快速二选一 🎯</p>
           <p className="text-white text-xl font-bold mb-5 leading-snug">{question?.question}</p>
           <div className="flex gap-3">
@@ -759,28 +691,23 @@ function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceRev
       <div className="mb-5 flex items-center gap-3">
         <svg width="64" height="64" viewBox="0 0 64 64" className="timer-ring">
           <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="5" />
-          <circle
-            cx="32" cy="32" r="28"
-            fill="none" stroke={timerColor} strokeWidth="5" strokeLinecap="round"
-            strokeDasharray={circumference}
-            strokeDashoffset={circumference - progress}
-            className="timer-ring-circle"
-            style={{ filter: `drop-shadow(0 0 8px ${timerColor})` }}
-          />
+          <circle cx="32" cy="32" r="28" fill="none" stroke={timerColor} strokeWidth="5" strokeLinecap="round"
+            strokeDasharray={circumference} strokeDashoffset={circumference - progress}
+            className="timer-ring-circle" style={{ filter: `drop-shadow(0 0 8px ${timerColor})` }} />
         </svg>
         <span className="text-5xl font-black" style={{ color: timerColor, textShadow: `0 0 20px ${timerColor}` }}>
           {timeLeft}
         </span>
       </div>
 
-      {/* Other players status (show voted/not voted, NOT which option) */}
+      {/* Other players' vote status (show voted/not voted, NOT which option) */}
       <div className="w-full max-w-lg mb-5">
         <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
-          <p className="text-white/30 text-xs mb-3 text-center">投票状态（结果揭晓前隐藏）</p>
+          <p className="text-white/30 text-xs mb-3 text-center">投票状态（揭晓前隐藏选项）</p>
           <div className="space-y-2">
             {Object.entries(players).map(([uid, p]) => {
               const hasVoted = !!votes[uid];
-              const isMe = uid === myUid;
+              const isMe     = uid === myUid;
               return (
                 <div key={uid} className="flex items-center gap-3">
                   <div className="w-7 h-7 rounded-full bg-gradient-to-br from-purple-500 to-pink-500 flex items-center justify-center text-xs font-bold flex-shrink-0">
@@ -789,15 +716,10 @@ function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceRev
                   <span className="text-white text-sm font-medium flex-1">
                     {p.name} {isMe && <span className="text-white/30 text-xs">（你）</span>}
                   </span>
-                  {hasVoted ? (
-                    <span className="text-xs px-2 py-1 rounded-full bg-green-500/20 text-green-400 font-medium">
-                      ✅ 已选择
-                    </span>
-                  ) : (
-                    <span className="text-xs px-2 py-1 rounded-full bg-white/10 text-white/30">
-                      ⏳ 选择中
-                    </span>
-                  )}
+                  {hasVoted
+                    ? <span className="text-xs px-2 py-1 rounded-full bg-green-500/20 text-green-400 font-medium">✅ 已选择</span>
+                    : <span className="text-xs px-2 py-1 rounded-full bg-white/10 text-white/30">⏳ 选择中</span>
+                  }
                 </div>
               );
             })}
@@ -805,42 +727,33 @@ function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceRev
         </div>
       </div>
 
-      {/* My vote buttons */}
+      {/* Vote buttons */}
       {!myVote ? (
         <div className="w-full max-w-lg">
           <p className="text-white/40 text-xs text-center mb-3">你的选择（对方看不到）</p>
           <div className="flex gap-3">
-            <button
-              onClick={() => onVote('A')}
-              className="flex-1 py-5 rounded-2xl vote-btn-a text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95"
-            >
+            <button onClick={() => onVote('A')}
+              className="flex-1 py-5 rounded-2xl vote-btn-a text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95">
               A
             </button>
-            <button
-              onClick={() => onVote('B')}
-              className="flex-1 py-5 rounded-2xl vote-btn-b text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95"
-            >
+            <button onClick={() => onVote('B')}
+              className="flex-1 py-5 rounded-2xl vote-btn-b text-white font-black text-2xl shadow-lg transition-all hover:scale-105 active:scale-95">
               B
             </button>
           </div>
         </div>
       ) : (
-        <div className="w-full max-w-lg">
-          <div className="text-center py-4 bg-white/5 border border-white/10 rounded-2xl">
-            <p className="text-white font-bold text-lg">
-              你选了 <span className={myVote === 'A' ? 'text-indigo-400' : 'text-pink-400'}>{myVote}</span>
-            </p>
-            <p className="text-white/40 text-sm mt-1">等待其他人选择...</p>
-          </div>
+        <div className="w-full max-w-lg text-center py-4 bg-white/5 border border-white/10 rounded-2xl">
+          <p className="text-white font-bold text-lg">
+            你选了 <span className={myVote === 'A' ? 'text-indigo-400' : 'text-pink-400'}>{myVote}</span>
+          </p>
+          <p className="text-white/40 text-sm mt-1">等待其他人选择...</p>
         </div>
       )}
 
-      {/* Host: force reveal */}
       {isHost && (
-        <button
-          onClick={onForceReveal}
-          className="mt-4 px-5 py-2 rounded-xl bg-white/10 text-white/50 text-sm hover:bg-white/20 transition-all"
-        >
+        <button onClick={onForceReveal}
+          className="mt-4 px-5 py-2 rounded-xl bg-white/10 text-white/50 text-sm hover:bg-white/20 transition-all">
           ⚡ 提前揭晓结果
         </button>
       )}
@@ -851,15 +764,15 @@ function VotingPhase({ room, myUid, myVote, timeLeft, isHost, onVote, onForceRev
 // ═════════════════════════════════════════════════════════════════════════════
 //  REVEALING PHASE
 // ═════════════════════════════════════════════════════════════════════════════
-function RevealingPhase({ room, myUid, isLoser, players, skipChances, onDrawCard, onSkip }) {
+function RevealingPhase({ room, isLoser, players, skipChances, onDrawCard, onSkip }) {
   const breakdown = room?.voteBreakdown;
-  const question = room?.currentQuestion;
+  const question  = room?.currentQuestion;
   const [shake, setShake] = useState(false);
 
   useEffect(() => {
-    const t = setTimeout(() => setShake(true), 200);
+    const t1 = setTimeout(() => setShake(true), 200);
     const t2 = setTimeout(() => setShake(false), 800);
-    return () => { clearTimeout(t); clearTimeout(t2); };
+    return () => { clearTimeout(t1); clearTimeout(t2); };
   }, []);
 
   return (
@@ -870,85 +783,63 @@ function RevealingPhase({ room, myUid, isLoser, players, skipChances, onDrawCard
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
             <p className="text-white/30 text-xs text-center mb-3">投票结果揭晓</p>
             <div className="flex gap-4">
-              <div className="flex-1 text-center">
-                <p className="text-indigo-400 font-bold text-xs mb-2">
-                  {question?.optionA}
-                  <span className="text-white/30 ml-1">({breakdown.a.length}票)</span>
-                </p>
-                <div className="flex flex-wrap gap-1 justify-center">
-                  {breakdown.a.map((name) => (
-                    <span key={name} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      breakdown.minority === 'A'
-                        ? 'bg-red-500/30 text-red-300'
-                        : 'bg-indigo-500/20 text-indigo-300'
-                    }`}>{name}</span>
-                  ))}
+              {[
+                { names: breakdown.a, option: question?.optionA, side: 'A', color: 'indigo', minority: breakdown.minority === 'A' },
+                { names: breakdown.b, option: question?.optionB, side: 'B', color: 'pink',   minority: breakdown.minority === 'B' },
+              ].map(({ names, option, side, color, minority }) => (
+                <div key={side} className="flex-1 text-center">
+                  <p className={`text-${color}-400 font-bold text-xs mb-2`}>
+                    {option} <span className="text-white/30">({names.length}票)</span>
+                  </p>
+                  <div className="flex flex-wrap gap-1 justify-center">
+                    {names.map((name) => (
+                      <span key={name} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
+                        minority ? 'bg-red-500/30 text-red-300' : `bg-${color}-500/20 text-${color}-300`
+                      }`}>{name}</span>
+                    ))}
+                  </div>
                 </div>
-              </div>
-              <div className="w-px bg-white/10" />
-              <div className="flex-1 text-center">
-                <p className="text-pink-400 font-bold text-xs mb-2">
-                  {question?.optionB}
-                  <span className="text-white/30 ml-1">({breakdown.b.length}票)</span>
-                </p>
-                <div className="flex flex-wrap gap-1 justify-center">
-                  {breakdown.b.map((name) => (
-                    <span key={name} className={`text-xs px-2 py-0.5 rounded-full font-medium ${
-                      breakdown.minority === 'B'
-                        ? 'bg-red-500/30 text-red-300'
-                        : 'bg-pink-500/20 text-pink-300'
-                    }`}>{name}</span>
-                  ))}
-                </div>
-              </div>
+              ))}
             </div>
             {breakdown.minority === 'tie' && (
-              <p className="text-yellow-400 text-xs text-center mt-2">票数相同，从全体随机抽取</p>
+              <p className="text-yellow-400 text-xs text-center mt-2">票数相同，全体随机抽取</p>
             )}
           </div>
         </div>
       )}
 
-      {/* Loser reveal */}
+      {/* Loser */}
       <div className={`w-full max-w-lg mb-5 loser-enter ${shake ? 'animate-shake' : ''}`}>
         <div className="bg-gradient-to-br from-red-900/50 to-orange-900/50 border border-red-500/40 rounded-3xl p-6 text-center shadow-2xl shadow-red-500/20">
           <p className="text-red-400/60 text-xs tracking-widest uppercase mb-2">💀 本轮输家</p>
           <div className="text-6xl mb-2">😬</div>
           <h2 className="text-4xl font-black text-white">{room.loserName}</h2>
-          {isLoser && (
-            <p className="text-red-300/70 text-sm mt-2">就是你！</p>
-          )}
+          {isLoser && <p className="text-red-300/70 text-sm mt-1">就是你！</p>}
         </div>
       </div>
 
       {/* Actions */}
       {isLoser ? (
         <div className="w-full max-w-lg space-y-3">
-          <button
-            onClick={onDrawCard}
-            className="w-full py-4 rounded-2xl bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white font-black text-lg shadow-2xl shadow-purple-500/30 hover:scale-[1.02] transition-all"
-          >
+          <button onClick={onDrawCard}
+            className="w-full py-4 rounded-2xl bg-gradient-to-r from-purple-600 via-pink-600 to-orange-500 text-white font-black text-lg shadow-2xl shadow-purple-500/30 hover:scale-[1.02] transition-all">
             🃏 抽一张题卡
           </button>
           {skipChances > 0 ? (
-            <button
-              onClick={onSkip}
-              className="w-full py-3 rounded-2xl bg-white/10 text-white/60 font-medium text-sm border border-white/10 hover:bg-white/20 transition-all"
-            >
+            <button onClick={onSkip}
+              className="w-full py-3 rounded-2xl bg-white/10 text-white/60 font-medium text-sm border border-white/10 hover:bg-white/20 transition-all">
               🏃 使用跳过机会（剩余 {skipChances} 次）
             </button>
           ) : (
-            <div className="text-center py-2 text-white/30 text-sm">
-              😤 没有退路了，必须回答
-            </div>
+            <div className="text-center py-2 text-white/30 text-sm">😤 没有退路了，必须回答</div>
           )}
         </div>
       ) : (
         <div className="text-center py-6">
           <div className="flex items-center justify-center gap-2 mb-3">
-            <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-            <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-            <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+            {['0ms','150ms','300ms'].map((d, i) => (
+              <div key={i} className={`w-2 h-2 rounded-full animate-bounce ${['bg-purple-400','bg-pink-400','bg-orange-400'][i]}`} style={{ animationDelay: d }} />
+            ))}
           </div>
           <p className="text-white/40 text-sm">等待 {room.loserName} 选择...</p>
         </div>
@@ -962,7 +853,7 @@ function RevealingPhase({ room, myUid, isLoser, players, skipChances, onDrawCard
 // ═════════════════════════════════════════════════════════════════════════════
 function DeckSelectPhase({ room, isLoser, onSelectDeck, onSelectRandom }) {
   const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
-  const ids = DECK_IDS[intensity] || DECK_IDS.random;
+  const ids            = DECK_IDS[intensity] || DECK_IDS.random;
   const availableDecks = decks.filter(
     (d) => ids.includes(d.id) && (gameMode !== 'truth' || d.type !== 'dare')
   );
@@ -971,11 +862,11 @@ function DeckSelectPhase({ room, isLoser, onSelectDeck, onSelectRandom }) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center px-4 page-enter">
         <div className="text-5xl mb-4 animate-float">🃏</div>
-        <p className="text-white/60 text-lg font-bold text-center">{room.loserName} 正在选题卡...</p>
+        <p className="text-white/60 text-lg font-bold">{room.loserName} 正在选题卡...</p>
         <div className="flex items-center justify-center gap-2 mt-4">
-          <div className="w-2 h-2 rounded-full bg-purple-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-          <div className="w-2 h-2 rounded-full bg-pink-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-          <div className="w-2 h-2 rounded-full bg-orange-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+          {['0ms','150ms','300ms'].map((d, i) => (
+            <div key={i} className={`w-2 h-2 rounded-full animate-bounce ${['bg-purple-400','bg-pink-400','bg-orange-400'][i]}`} style={{ animationDelay: d }} />
+          ))}
         </div>
       </div>
     );
@@ -983,35 +874,26 @@ function DeckSelectPhase({ room, isLoser, onSelectDeck, onSelectRandom }) {
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
-      <p className="text-white/50 text-sm mb-2 text-center">选择你的题卡类型</p>
+      <p className="text-white/50 text-sm mb-1 text-center">选择题卡类型</p>
       <p className="text-white/30 text-xs mb-4">或者让命运决定</p>
-
       <div className="w-full max-w-lg mb-4">
-        <button
-          onClick={onSelectRandom}
-          className="w-full py-4 rounded-2xl bg-white/10 border border-white/15 text-white font-bold text-base hover:bg-white/20 hover:border-purple-400 transition-all"
-        >
+        <button onClick={onSelectRandom}
+          className="w-full py-4 rounded-2xl bg-white/10 border border-white/15 text-white font-bold hover:bg-white/20 hover:border-purple-400 transition-all">
           🎲 随机一张（命运决定）
         </button>
       </div>
-
       <div className="w-full max-w-lg grid grid-cols-2 gap-3">
         {availableDecks.map((deck) => (
-          <button
-            key={deck.id}
-            onClick={() => onSelectDeck(deck)}
+          <button key={deck.id} onClick={() => onSelectDeck(deck)}
             className={`relative overflow-hidden rounded-2xl p-4 text-left bg-gradient-to-br ${deck.gradient} shadow-lg hover:scale-105 active:scale-95 transition-all group`}
-            style={{ boxShadow: `0 8px 30px ${deck.glow}` }}
-          >
+            style={{ boxShadow: `0 8px 30px ${deck.glow}` }}>
             <div className="shimmer absolute inset-0 opacity-0 group-hover:opacity-100 transition-opacity" />
             <div className="text-3xl mb-2">{deck.icon}</div>
             <p className="text-white font-bold text-sm">{deck.name}</p>
             <p className="text-white/60 text-xs mt-0.5">{deck.description}</p>
             <span className={`inline-block mt-2 text-xs px-2 py-0.5 rounded-full font-medium ${
               deck.type === 'truth' ? 'bg-white/20 text-white' : 'bg-black/30 text-white/80'
-            }`}>
-              {deck.type === 'truth' ? '💬 真心话' : '🎯 大冒险'}
-            </span>
+            }`}>{deck.type === 'truth' ? '💬 真心话' : '🎯 大冒险'}</span>
           </button>
         ))}
       </div>
@@ -1020,61 +902,50 @@ function DeckSelectPhase({ room, isLoser, onSelectDeck, onSelectRandom }) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-//  CARD REVEAL PHASE  (explanation time here)
+//  CARD REVEAL PHASE  (解释时间在这里)
 // ═════════════════════════════════════════════════════════════════════════════
 function CardRevealPhase({ room, myUid, players, myReady, onFlip, onReady }) {
-  const cardHeight = 300;
-  const flipped = room?.cardFlipped;
+  const cardHeight     = 300;
+  const flipped        = room?.cardFlipped;
+  const isSkipPenalty  = room?.deckName === '跳过惩罚';
+  const playerList     = Object.entries(players);
+  const readyCount     = playerList.filter(([, p]) => p.ready).length;
+
   const deck = {
     name: room?.deckName,
     icon: room?.deckIcon,
     gradient: room?.deckGradient || 'from-purple-600 to-indigo-800',
-    glow: room?.deckGlow || 'rgba(139,92,246,0.5)',
+    glow:     room?.deckGlow     || 'rgba(139,92,246,0.5)',
   };
-  const isSkipPenalty = room?.deckName === '跳过惩罚';
-
-  const playerList = Object.entries(players);
-  const readyCount = playerList.filter(([, p]) => p.ready).length;
 
   return (
     <div className="flex-1 flex flex-col items-center px-4 py-4 page-enter">
       <p className="text-white/50 text-sm mb-1 text-center">
         <span className="text-white font-bold">{room?.loserName}</span> 抽到了 {deck.icon} {deck.name}
       </p>
-      {isSkipPenalty && (
-        <p className="text-yellow-400/70 text-xs mb-3 text-center">跳过了！接受轻度惩罚</p>
-      )}
+      {isSkipPenalty && <p className="text-yellow-400/70 text-xs mb-3">跳过了！接受轻度惩罚</p>}
 
       {/* 3D flip card */}
-      <div
-        className="w-full max-w-sm mb-5 cursor-pointer"
-        style={{ height: cardHeight }}
-        onClick={!flipped ? onFlip : undefined}
-      >
+      <div className="w-full max-w-sm mb-5 cursor-pointer" style={{ height: cardHeight }}
+        onClick={!flipped ? onFlip : undefined}>
         <div className="card-flip-container" style={{ height: cardHeight }}>
           <div className={`card-inner ${flipped ? 'flipped' : ''}`} style={{ height: cardHeight }}>
             {/* Front */}
             <div className="card-face" style={{ height: cardHeight }}>
-              <div
-                className={`w-full h-full bg-gradient-to-br ${deck.gradient} flex flex-col items-center justify-center rounded-3xl border border-white/20 shadow-2xl`}
-                style={{ boxShadow: `0 20px 60px ${deck.glow}` }}
-              >
+              <div className={`w-full h-full bg-gradient-to-br ${deck.gradient} flex flex-col items-center justify-center rounded-3xl border border-white/20 shadow-2xl`}
+                style={{ boxShadow: `0 20px 60px ${deck.glow}` }}>
                 <div className="text-7xl mb-4 animate-float">{deck.icon}</div>
                 <p className="text-white font-bold text-xl">{deck.name}</p>
-                <p className="text-white/60 text-sm mt-2">
-                  {flipped ? '' : '点击翻牌 🃏'}
-                </p>
+                {!flipped && <p className="text-white/60 text-sm mt-2">点击翻牌 🃏</p>}
               </div>
             </div>
             {/* Back */}
             <div className="card-face card-back-face" style={{ height: cardHeight }}>
-              <div
-                className="w-full h-full bg-gradient-to-br from-gray-900 to-gray-800 flex flex-col items-center justify-center rounded-3xl px-6 text-center"
+              <div className="w-full h-full bg-gradient-to-br from-gray-900 to-gray-800 flex flex-col items-center justify-center rounded-3xl px-6 text-center"
                 style={{
-                  border: `2px solid ${deck.glow?.replace('0.5', '0.7') ?? 'rgba(168,85,247,0.7)'}`,
+                  border: `2px solid ${deck.glow?.replace('0.5','0.7') ?? 'rgba(168,85,247,0.7)'}`,
                   boxShadow: `0 20px 60px ${deck.glow}, inset 0 0 40px rgba(255,255,255,0.03)`,
-                }}
-              >
+                }}>
                 <div className="text-3xl mb-4">{deck.icon}</div>
                 <p className="text-white text-base font-semibold leading-snug">{room?.card}</p>
               </div>
@@ -1084,10 +955,8 @@ function CardRevealPhase({ room, myUid, players, myReady, onFlip, onReady }) {
       </div>
 
       {!flipped ? (
-        <button
-          onClick={onFlip}
-          className="px-8 py-4 rounded-2xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-bold text-lg shadow-lg hover:scale-105 transition-all"
-        >
+        <button onClick={onFlip}
+          className="px-8 py-4 rounded-2xl bg-gradient-to-r from-purple-600 to-pink-600 text-white font-bold text-lg shadow-lg hover:scale-105 transition-all">
           🃏 翻开题卡
         </button>
       ) : (
@@ -1096,42 +965,32 @@ function CardRevealPhase({ room, myUid, players, myReady, onFlip, onReady }) {
           <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4 text-center">
             <p className="text-amber-300 font-bold text-sm mb-1">⏸ 解释时间</p>
             <p className="text-white/40 text-xs">
-              {isSkipPenalty
-                ? '完成上面的惩罚后，所有人点击"下一轮"继续'
-                : room?.deckId?.startsWith('dare')
-                ? '完成大冒险后，所有人点击"下一轮"继续'
-                : '认真回答后，所有人点击"下一轮"继续'}
+              {isSkipPenalty ? '完成惩罚后' : room?.deckId?.startsWith('dare') ? '完成大冒险后' : '认真回答后'}
+              ，所有人都点"下一轮"才会继续
             </p>
           </div>
 
-          {/* Ready status */}
+          {/* Who's ready */}
           <div className="bg-white/5 border border-white/10 rounded-2xl p-4">
             <p className="text-white/30 text-xs mb-3 text-center">
               已准备好 {readyCount}/{playerList.length}
             </p>
-            <div className="flex gap-3 justify-center flex-wrap">
+            <div className="flex gap-4 justify-center flex-wrap">
               {playerList.map(([uid, p]) => (
                 <div key={uid} className="flex items-center gap-1.5">
-                  <span className={p.ready ? 'text-green-400' : 'text-white/30'}>
-                    {p.ready ? '✅' : '⏳'}
-                  </span>
-                  <span className={`text-sm font-medium ${p.ready ? 'text-white' : 'text-white/40'}`}>
-                    {p.name}
-                  </span>
+                  <span className={p.ready ? 'text-green-400' : 'text-white/30'}>{p.ready ? '✅' : '⏳'}</span>
+                  <span className={`text-sm font-medium ${p.ready ? 'text-white' : 'text-white/40'}`}>{p.name}</span>
                 </div>
               ))}
             </div>
           </div>
 
-          <button
-            onClick={onReady}
-            disabled={myReady}
+          <button onClick={onReady} disabled={myReady}
             className={`w-full py-4 rounded-2xl font-bold text-lg transition-all ${
               myReady
                 ? 'bg-green-600/30 text-green-400 border border-green-500/30 cursor-default'
                 : 'bg-gradient-to-r from-green-600 to-emerald-600 text-white shadow-lg hover:opacity-90 hover:scale-[1.02]'
-            }`}
-          >
+            }`}>
             {myReady ? '✅ 我已准备好，等待其他人...' : '✅ 说完了，下一轮 →'}
           </button>
         </div>
@@ -1145,38 +1004,28 @@ function CardRevealPhase({ room, myUid, players, myReady, onFlip, onReady }) {
 // ═════════════════════════════════════════════════════════════════════════════
 function HistoryModal({ history, onClose }) {
   const entries = Object.values(history).sort((a, b) => a.round - b.round);
-
   return (
-    <div
-      className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-4"
-      onClick={onClose}
-    >
-      <div
-        className="bg-gray-950 border border-white/15 rounded-3xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden"
-        onClick={(e) => e.stopPropagation()}
-      >
+    <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-50 flex items-end sm:items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-gray-950 border border-white/15 rounded-3xl w-full max-w-lg max-h-[80vh] flex flex-col overflow-hidden" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between px-5 py-4 border-b border-white/10">
           <h3 className="text-white font-bold">📋 本局历史</h3>
           <button onClick={onClose} className="text-white/40 hover:text-white/80 text-2xl leading-none">×</button>
         </div>
         <div className="overflow-y-auto flex-1 p-4 space-y-3">
-          {entries.length === 0 ? (
-            <p className="text-white/30 text-center py-8 text-sm">还没有记录</p>
-          ) : (
-            entries.map((e) => (
+          {entries.length === 0
+            ? <p className="text-white/30 text-center py-8 text-sm">还没有记录</p>
+            : entries.map((e) => (
               <div key={e.round} className="bg-white/5 border border-white/10 rounded-2xl p-4">
                 <div className="flex items-center gap-2 mb-1.5">
-                  <span className="text-xs font-bold px-2 py-0.5 bg-purple-500/30 text-purple-300 rounded-full">
-                    第 {e.round} 轮
-                  </span>
+                  <span className="text-xs font-bold px-2 py-0.5 bg-purple-500/30 text-purple-300 rounded-full">第 {e.round} 轮</span>
                   <span className="text-red-400 text-xs font-medium">输家：{e.loserName}</span>
                 </div>
-                <p className="text-white/40 text-xs mb-1">
-                  {e.question} — A: {(e.voteA || []).join('、') || '无'} / B: {(e.voteB || []).join('、') || '无'}
+                <p className="text-white/40 text-xs">
+                  {e.question} — A: {(e.voteA||[]).join('、')||'无'} / B: {(e.voteB||[]).join('、')||'无'}
                 </p>
               </div>
             ))
-          )}
+          }
         </div>
       </div>
     </div>
