@@ -443,7 +443,7 @@ export default function App() {
       </header>
 
       <div className="flex-1 flex flex-col relative z-10">
-        {phase === 'lobby'       && <LobbyPhase     room={room} myUid={myUid} isHost={isHost} onStart={doStart} onSettings={doUpdateSettings} onCopyCode={doCopyCode} copied={copied} />}
+        {phase === 'lobby'       && <LobbyPhase     room={room} roomCode={roomCode} myUid={myUid} isHost={isHost} onStart={doStart} onSettings={doUpdateSettings} onCopyCode={doCopyCode} copied={copied} />}
         {phase === 'voting'      && <VotingPhase    room={room} myUid={myUid} myVote={myVote} timeLeft={timeLeft} isHost={isHost} onVote={doVote} onForceReveal={doForceReveal} />}
         {phase === 'revealing'   && <RevealingPhase room={room} myUid={myUid} isLoser={isLoser} players={players} skipChances={players[myUid]?.skipChances ?? 0} onDrawCard={doGoToDeckSelect} onSkip={doSkip} />}
         {phase === 'deck-select' && <DeckSelectPhase room={room} isLoser={isLoser} onSelectDeck={doSelectDeck} onSelectRandom={doSelectRandom} />}
@@ -554,7 +554,7 @@ function HomeScreen({ myName, setMyName, joinCode, setJoinCode, error, busy, onC
 // ═════════════════════════════════════════════════════════════════════════════
 //  LOBBY PHASE
 // ═════════════════════════════════════════════════════════════════════════════
-function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copied }) {
+function LobbyPhase({ room, roomCode, myUid, isHost, onStart, onSettings, onCopyCode, copied }) {
   const players    = room?.players || {};
   const playerList = Object.entries(players);
   const { gameMode = 'both', intensity = 'random' } = room?.settings || {};
@@ -566,7 +566,7 @@ function LobbyPhase({ room, myUid, isHost, onStart, onSettings, onCopyCode, copi
       <div className="w-full max-w-sm mb-5">
         <div className="bg-gradient-to-br from-purple-900/60 to-indigo-900/60 border border-purple-500/30 rounded-3xl p-6 text-center">
           <p className="text-white/40 text-xs mb-2 tracking-widest uppercase">房间号</p>
-          <p className="text-5xl font-black font-mono tracking-[0.3em] text-white mb-4">{room?.code ?? '----'}</p>
+          <p className="text-5xl font-black font-mono tracking-[0.3em] text-white mb-4">{roomCode || '----'}</p>
           <button
             onClick={onCopyCode}
             className="px-6 py-2.5 rounded-xl bg-purple-600/40 text-purple-300 text-sm font-bold hover:bg-purple-600/60 transition-all"
