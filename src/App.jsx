@@ -190,8 +190,8 @@ export default function App() {
       if (insertErr) throw insertErr;
       setRoomCode(code);
       setScreen('game');
-    } catch {
-      setError('创建失败，请检查 Supabase 配置和 SQL 是否已执行');
+    } catch (e) {
+      setError('创建失败：' + (e?.message || e?.code || JSON.stringify(e)));
     }
     setBusy(false);
   };
