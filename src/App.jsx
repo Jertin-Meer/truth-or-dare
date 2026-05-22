@@ -58,13 +58,13 @@ function Stars() {
 // ── Supabase helpers ─────────────────────────────────────────────────────────
 const getRoom = async (code) => {
   const { data, error } = await supabase
-    .from('rooms').select('state').eq('code', code).single();
+    .from('tod_rooms').select('state').eq('code', code).single();
   if (error) return null;
   return data?.state ?? null;
 };
 
 const setRoomState = async (code, state) => {
-  await supabase.from('rooms').update({ state }).eq('code', code);
+  await supabase.from('tod_rooms').update({ state }).eq('code', code);
 };
 
 // ── App ──────────────────────────────────────────────────────────────────────
@@ -109,7 +109,7 @@ export default function App() {
       .channel(`room-${roomCode}`)
       .on(
         'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'rooms', filter: `code=eq.${roomCode}` },
+        { event: 'UPDATE', schema: 'public', table: 'tod_rooms', filter: `code=eq.${roomCode}` },
         (payload) => { if (payload.new?.state) setRoom(payload.new.state); }
       )
       .subscribe((status) => {
@@ -170,7 +170,7 @@ export default function App() {
       let code;
       for (let i = 0; i < 10; i++) {
         code = genCode();
-        const { data } = await supabase.from('rooms').select('code').eq('code', code).single();
+        const { data } = await supabase.from('tod_rooms').select('code').eq('code', code).single();
         if (!data) break;
       }
       const initialState = {
@@ -186,7 +186,7 @@ export default function App() {
         usedCardIds: {},
         history: {},
       };
-      const { error: insertErr } = await supabase.from('rooms').insert({ code, state: initialState });
+      const { error: insertErr } = await supabase.from('tod_rooms').insert({ code, state: initialState });
       if (insertErr) throw insertErr;
       setRoomCode(code);
       setScreen('game');
